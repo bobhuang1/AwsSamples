@@ -1,0 +1,24 @@
+## Terraform
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+!*.tfvars.sample
+crash.log
+crash.*.log
+
+## .NET
+bin/
+obj/
+
+## dotnet publish staging dirs (consumed into dist zips)
+**/lambdas/*/publish/
+
+## Published Lambda zips (created by publish.ps1)
+**/terraform/dist/
+
+## IDE / OS
+.idea/
+.vscode/
+Thumbs.db
+.DS_Store

@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Shopping Api sample</title>
+  <style>
+    body { font: 16px/1.5 system-ui, sans-serif; margin: 2rem; max-width: 60rem; }
+    input, button { padding: .4rem .6rem; font-size: 1rem; }
+    pre { background: #f4f4f5; padding: 1rem; overflow-x: auto; }
+    table { border-collapse: collapse; width: 100%; }
+    th, td { text-align: left; padding: .4rem; border-bottom: 1px solid #d4d4d8; }
+  </style>
+</head>
+<body>
+  <h1>Shopping API sample</h1>
+  <p>
+    API endpoint:
+    <input id="api" value="https://YOUR-API.execute-api.us-east-1.amazonaws.com/v1" size="60">
+    <button onclick="loadProducts()">Load catalog</button>
+  </p>
+  <pre id="out">Click "Load catalog" (the <b>GET /products</b> route is public; other routes require a Cognito JWT).</pre>
+
+  <h2>Catalog</h2>
+  <table id="catalog"></table>
+
+  <script>
+    const $ = (sel) => document.querySelector(sel);
+
+    async function req(path) {
+      const res = await fetch($("#api").value + path);
+      const text = await res.text();
+      if (!res.ok) throw new Error(res.status + " " + text);
+      return text ? JSON.parse(text) : null;
+    }
+
+    async function loadProducts() {
+      try {
+        const products = await req("/products");
+        $("#out").textContent = JSON.stringify(products, null, 2);
+        $("#catalog").innerHTML =
+          "<tr><th>id</th><th>name</th><th>category</th><th>price</th></tr>" +
+          products.map(p =>
+            `<tr><td>${p.product_id}</td><td>${p.name}</td><td>${p.category}</td><td>${p.price}</td></tr>`
+          ).join("");
+      } catch (e) {
+        $("#out").textContent = "Error: " + e.message;
+      }
+    }
+  </script>
+</body>
+</html>

@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <RootNamespace>GameBackend</RootNamespace>
+    <AssemblyName>GameBackend</AssemblyName>
+    <PublishReadyToRun>false</PublishReadyToRun>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Amazon.Lambda.Core" Version="2.*" />
+    <PackageReference Include="Amazon.Lambda.Serialization.SystemTextJson" Version="2.*" />
+    <PackageReference Include="Amazon.Lambda.APIGatewayEvents" Version="2.*" />
+    <PackageReference Include="AWSSDK.DynamoDBv2" Version="3.*" />
+    <PackageReference Include="AWSSDK.ApiGatewayManagementApi" Version="3.*" />
+    <PackageReference Include="AWSSDK.S3" Version="3.*" />
+  </ItemGroup>
+</Project>

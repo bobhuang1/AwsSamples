@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Chat sample</title>
+  <style>
+    body { font: 16px/1.5 system-ui, sans-serif; margin: 2rem; max-width: 46rem; }
+    #log { border: 1px solid #d4d4d8; height: 22rem; overflow-y: auto; padding: .5rem; margin: .75rem 0; background: #fafafa; }
+    .msg b { color: #4f46e5; }
+    .meta { color: #71717a; font-size: .85rem; }
+    input, button { padding: .4rem .6rem; font-size: 1rem; }
+    .row { display: flex; gap: .5rem; margin-bottom: .5rem; }
+    .row input { flex: 1; }
+  </style>
+</head>
+<body>
+  <h1>Large-scale chat sample (WebSocket + DynamoDB + SQS fan-out)</h1>
+
+  <div class="row">
+    <input id="ws" placeholder="wss://YOUR-API.execute-api.us-east-1.amazonaws.com/v1" size="55">
+  </div>
+  <div class="row">
+    <input id="nick" placeholder="nickname" value="you">
+    <input id="room" placeholder="roomId" value="general">
+    <button id="connect">Connect</button>
+  </div>
+  <div class="row">
+    <input id="text" placeholder="type a message and press Enter">
+    <button id="send">Send</button>
+  </div>
+
+  <div id="log"></div>
+  <p class="meta">Open two tabs with different nicknames in the same room to watch the relay live.</p>
+
+  <script>
+    const log = (html) => { const d = document.createElement("div"); d.innerHTML = html; document.querySelector("#log").append(d); };
+    let ws = null;
+
+    document.querySelector("#connect").onclick = () => {
+      const url = `${document.querySelector("#ws").value.replace(/^wss?:\/\//, "wss://")}?nickname=${encodeURIComponent(document.querySelector("#nick").value)}&userId=${encodeURIComponent("u-" + Date.now())}&roomId=${encodeURIComponent(document.querySelector("#room").value)}`;
+      ws = new WebSocket(url);
+      ws.onopen = () => log("<div class='meta'>connected</div>");
+      ws.onclose = () => log("<div class='meta'>disconnected</div>");
+      ws.onmessage = (e) => {
+        const data = JSON.parse(e.data);
+        if (data.type === "message") {
+          const m = data.message;
+          log(`<div><span class="meta">${new Date(m.created_at).toLocaleTimeString()}</span> <b>${esc(m.nickname)}</b>: ${esc(m.text)}</div>`);
+        }
+      };
+    };
+
+    const sendNow = () => {
+      const text = document.querySelector("#text").value;
+      if (!text || !ws || ws.readyState !== 1) return;
+      ws.send(JSON.stringify({ action: "send", roomId: document.querySelector("#room").value, text }));
+      document.querySelector("#text").value = "";
+    };
+    document.querySelector("#send").onclick = sendNow;
+    document.querySelector("#text").onkeydown = (e) => { if (e.key === "Enter") sendNow(); };
+
+    const esc = (s) => s.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+  </script>
+</body>
+</html>
