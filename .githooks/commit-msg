@@ -1,0 +1,73 @@
+#!/bin/sh
+#
+# Refuses commit messages that credit Claude, Claude Code, Anthropic, Codebuff or
+# codebuff-team as a contributor, co-author or generator.
+#
+# The project owner has explicitly opted out of ALL AI co-authorship trailers, in this
+# repository and across the workspace's other repositories, so this is a standing rule
+# rather than a preference of one session.
+#
+# Enable it once per clone (a hook in .git/hooks/ needs no configuration but does not travel with
+# the repository, which is why the real file lives here):
+#
+#     git config core.hooksPath .githooks
+#
+# It matches *attribution* only — a trailer, an identity or a "generated with" notice. A commit
+# message that merely mentions the file CLAUDE.md, or quotes this rule, is fine, which is why the
+# patterns below are anchored rather than a plain search for "claude".
+#
+# To widen it to every vendor, add the name to FORBIDDEN below and keep the same anchoring.
+
+FORBIDDEN='claude|anthropic|codebuff'
+
+message_file=$1
+
+# The message file still holds the comment lines git adds to the editor buffer, so drop them: the
+# guidance above, or a heredoc quoting it, must not be able to trip the hook.
+stripped=$(mktemp)
+trap 'rm -f "$stripped"' EXIT
+grep -v '^#' "$message_file" > "$stripped" 2>/dev/null || : > "$stripped"
+
+offender=$(
+    {
+        # Co-Authored-By: Claude <noreply@anthropic.com>, Co-Authored-By: Codebuff <noreply@codebuff.com>,
+        # Assisted-by: ..., Signed-off-by: ..., Generated-with: ...
+        grep -inE "^[[:space:]]*(co-authored-by|co-author|signed-off-by|assisted-by|generated-with|claude-session|claude-code-session|codebuff-session)[[:space:]]*:.*($FORBIDDEN)" "$stripped"
+        # Any Anthropic address, wherever it appears.
+        grep -inE "@anthropic\.com" "$stripped"
+        # A "generated with ..." style notice, with or without the robot. This must
+        # test every name in FORBIDDEN, not just claude: a bare
+        # "Generated with Codebuff" is the form Codebuff actually writes, and
+        # hardcoding claude here let all 69 of them through.
+        grep -inE "(generated|written|created|assisted|powered)[[:space:]]+(with|by)[[:space:]]+($FORBIDDEN)" "$stripped"
+    } 2>/dev/null | awk '!seen[$0]++'
+)
+
+if [ -z "$offender" ]; then
+    # The identity is the other half of authorship; git will not normally have it set this way, but
+    # a CI job or a bot could.
+    if git var GIT_AUTHOR_IDENT 2>/dev/null | grep -qiE "($FORBIDDEN)"; then
+        echo "commit-msg: the author identity credits Claude/Anthropic:" >&2
+        git var GIT_AUTHOR_IDENT | sed 's/^/    /' >&2
+        exit 1
+    fi
+    exit 0
+fi
+
+cat >&2 <<'EOF'
+commit-msg: refusing this commit message.
+
+EOF
+echo "$offender" | sed 's/^/    /' >&2
+cat >&2 <<'EOF'
+
+Claude, Claude Code, Anthropic, Codebuff and codebuff-team must never be credited
+as an author, co-author or generator of a commit in this repository. Remove the
+trailer or the notice and commit again.
+
+If this is a false positive, commit once with `git commit --no-verify`, and
+please tighten the pattern in .githooks/commit-msg rather than leaving the rule
+unenforced.
+EOF
+
+exit 1
