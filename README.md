@@ -50,3 +50,7 @@ patterns (serverless, async queues, managed DBs) hold in multi-region too:
 put DynamoDB global tables behind the scenes, front everything with a global
 CloudFront distribution + WAF, and point API Gateways at regional replicas.
 Each README calls out the specific next step for that workload.
+
+## License
+
+This project is free software, released under the **GNU General Public License v3.0**. You may redistribute and/or modify it under those terms; see [LICENSE.md](LICENSE.md) for the full text.
