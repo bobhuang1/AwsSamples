@@ -62,7 +62,7 @@ public sealed class SessionHandler
             ["player_id"]     = playerId,
             ["match_id"]      = matchId,
             ["connected_at"]  = now.ToUnixTimeSeconds().ToString(),
-            ["ttl"]           = now.AddHours(1).ToUnixTimeSeconds().ToString(),
+            ["ttl"]           = now.AddHours(1).ToUnixTimeSeconds(), // DynamoDB TTL only honours a Number attribute
         });
         return Ok(connectionId, playerId, matchId);
     }

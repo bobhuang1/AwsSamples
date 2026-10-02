@@ -16,6 +16,8 @@ public sealed class ApiHandler
 {
     private static readonly JsonSerializerOptions JsonOpts = new(JsonSerializerDefaults.Web);
 
+    private const int MaxQuantityPerLine = 99;
+
     private static readonly Lazy<AmazonDynamoDBClient> Ddb = new(() => new AmazonDynamoDBClient());
     private static readonly Lazy<AmazonSQSClient> Sqs = new(() => new AmazonSQSClient());
     private static readonly Lazy<AmazonEventBridgeClient> Events = new(() => new AmazonEventBridgeClient());
@@ -36,9 +38,9 @@ public sealed class ApiHandler
             {
                 ("GET", "/products")                            => await ListProducts(request),
                 ("GET", _) when path.StartsWith("/products/")    => await GetProduct(path),
-                ("GET", _) when path.StartsWith("/cart/")        => await GetCart(path),
-                ("POST", _) when path.StartsWith("/cart/")       => await AddToCart(path, request),
-                ("DELETE", _) when path.StartsWith("/cart/")     => await RemoveFromCart(path),
+                ("GET", _) when path.StartsWith("/cart/")        => await WithOwnCart(request, path, () => GetCart(path)),
+                ("POST", _) when path.StartsWith("/cart/")       => await WithOwnCart(request, path, () => AddToCart(path, request)),
+                ("DELETE", _) when path.StartsWith("/cart/")     => await WithOwnCart(request, path, () => RemoveFromCart(path)),
                 ("POST", "/orders")                              => await CreateOrder(request),
                 _                                                => Json(NotFound("No route for " + method + " " + path)),
             };
@@ -48,6 +50,29 @@ public sealed class ApiHandler
             context.Logger.LogError("Handler failure: {0}", ex);
             return Json(new { error = ex.Message }, HttpStatusCode.InternalServerError);
         }
+    }
+
+    // ---------------- caller identity ----------------
+
+    /// <summary>
+    /// The signed-in shopper, from the Cognito JWT the API Gateway authorizer already
+    /// validated. Identity always comes from the token, never from the URL or body: the
+    /// authorizer only proves that *someone* is signed in.
+    /// </summary>
+    private static string? CallerId(APIGatewayHttpApiV2ProxyRequest request) =>
+        request.RequestContext?.Authorizer?.Jwt?.Claims is { } claims && claims.TryGetValue("sub", out var sub) && !string.IsNullOrEmpty(sub)
+            ? sub
+            : null;
+
+    /// <summary>/cart/{userId}/... is only reachable for the caller's own cart.</summary>
+    private static async Task<APIGatewayHttpApiV2ProxyResponse> WithOwnCart(
+        APIGatewayHttpApiV2ProxyRequest request, string path, Func<Task<APIGatewayHttpApiV2ProxyResponse>> next)
+    {
+        var caller = CallerId(request);
+        if (caller is null) return Json(new { error = "Sign in required." }, HttpStatusCode.Unauthorized);
+        if (!string.Equals(Segment(path, 2), caller, StringComparison.Ordinal))
+            return Json(new { error = "You can only access your own cart." }, HttpStatusCode.Forbidden);
+        return await next();
     }
 
     private async Task<APIGatewayHttpApiV2ProxyResponse> ListProducts(APIGatewayHttpApiV2ProxyRequest request)
@@ -90,6 +115,8 @@ public sealed class ApiHandler
         var userId = Segment(path, 2);
         var body = JsonSerializer.Deserialize<AddItemRequest>(request.Body, JsonOpts)
             ?? throw new InvalidOperationException("Body must be { productId, quantity }");
+        if (body.Quantity is < 1 or > MaxQuantityPerLine)
+            return Json(BadRequest($"quantity must be between 1 and {MaxQuantityPerLine}"));
 
         // Look up the product so prices are always taken from the catalog.
         var products = Table.LoadTable(Ddb.Value, _productsTable);
@@ -103,6 +130,15 @@ public sealed class ApiHandler
         var items = existing is { Count: > 0 } && existing.Contains("items")
             ? (existing["items"] as DynamoDBList)!.AsListOfDocument().ToList()
             : new List<Document>();
+
+        // One line per product: adding the same product again raises its quantity.
+        var current = items.FirstOrDefault(d => d["product_id"].AsString() == body.ProductId);
+        if (current is not null)
+        {
+            var merged = Math.Min(MaxQuantityPerLine, current["quantity"].AsInt() + body.Quantity);
+            items.Remove(current);
+            item = item with { Quantity = merged };
+        }
         items.Add(ItemToDoc(item));
 
         var doc = new Document
@@ -110,7 +146,7 @@ public sealed class ApiHandler
             ["user_id"]    = userId,
             ["items"]      = items,
             ["updated_at"] = DateTimeOffset.UtcNow.ToUnixTimeSeconds().ToString(),
-            ["ttl"]        = (DateTimeOffset.UtcNow.AddDays(7)).ToUnixTimeSeconds().ToString(),
+            ["ttl"]        = (DateTimeOffset.UtcNow.AddDays(7)).ToUnixTimeSeconds(), // DynamoDB TTL only honours a Number attribute
         };
         await cart.PutItemAsync(doc);
         return Json(Ok(new Cart(userId, items.Select(ItemFromDoc).ToList(), doc["updated_at"].AsString())));
@@ -139,11 +175,12 @@ public sealed class ApiHandler
 
     private async Task<APIGatewayHttpApiV2ProxyResponse> CreateOrder(APIGatewayHttpApiV2ProxyRequest request)
     {
-        var body = JsonSerializer.Deserialize<CreateOrderRequest>(request.Body, JsonOpts)
-            ?? throw new InvalidOperationException("Body must be { userId }");
+        // The order is always placed for the signed-in caller; a userId in the body is ignored.
+        var userId = CallerId(request);
+        if (userId is null) return Json(new { error = "Sign in required." }, HttpStatusCode.Unauthorized);
 
         var cart = Table.LoadTable(Ddb.Value, _cartsTable);
-        var existing = await cart.GetItemAsync(body.UserId);
+        var existing = await cart.GetItemAsync(userId);
         var items = existing is { Count: > 0 } && existing.Contains("items")
             ? (existing["items"] as DynamoDBList)!.AsListOfDocument().Select(ItemFromDoc).ToList()
             : new List<CartItem>();
@@ -151,18 +188,18 @@ public sealed class ApiHandler
 
         var orderId = Guid.NewGuid().ToString("N");
         var now = DateTimeOffset.UtcNow;
-        var order = new Order(orderId, body.UserId, "PLACED", now, items.Sum(i => i.Price * i.Quantity), items);
+        var order = new Order(orderId, userId, "PLACED", now, items.Sum(i => i.Price * i.Quantity), items);
 
         var orders = Table.LoadTable(Ddb.Value, _ordersTable);
         var doc = new Document
         {
             ["order_id"]   = orderId,
-            ["user_id"]    = body.UserId,
+            ["user_id"]    = userId,
             ["status"]     = order.status,
             ["created_at"] = now.ToUnixTimeSeconds().ToString(),
             ["total"]      = order.total.ToString("0.00"),
             ["items"]      = items.Select(ItemToDoc).ToList(),
-            ["ttl"]        = (now.AddDays(30)).ToUnixTimeSeconds().ToString(),
+            ["ttl"]        = (now.AddDays(30)).ToUnixTimeSeconds(), // DynamoDB TTL only honours a Number attribute
         };
         await orders.PutItemAsync(doc);
 
@@ -171,7 +208,7 @@ public sealed class ApiHandler
         {
             QueueUrl = _ordersQueue,
             MessageBody = JsonSerializer.Serialize(order, JsonOpts),
-            MessageGroupId = body.UserId,
+            MessageGroupId = userId,
         });
 
         // Announce it on the event bus for downstream consumers (search, BI, email...).
@@ -189,7 +226,7 @@ public sealed class ApiHandler
             }
         });
 
-        await cart.DeleteItemAsync(body.UserId);
+        await cart.DeleteItemAsync(userId);
         return Json(new { orderId, total = order.total, status = order.status }, HttpStatusCode.Created);
     }
 
@@ -244,4 +281,4 @@ public sealed record Cart(string user_id, IReadOnlyList<CartItem> items, string?
 public sealed record CartItem(string ProductId, string Name, decimal Price, int Quantity);
 public sealed record Order(string order_id, string user_id, string status, DateTimeOffset created_at, decimal total, IReadOnlyList<CartItem> items);
 public sealed record AddItemRequest(string ProductId, int Quantity);
-public sealed record CreateOrderRequest(string UserId);
+public sealed record CreateOrderRequest(string? UserId); // kept for compatibility; ignored

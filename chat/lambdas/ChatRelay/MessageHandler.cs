@@ -77,7 +77,7 @@ public sealed class MessageHandler
             ["nickname"]      = string.IsNullOrEmpty(nickname) ? userId : nickname,
             ["room_id"]       = roomId,
             ["connected_at"]  = now.ToUnixTimeSeconds().ToString(),
-            ["ttl"]           = now.AddHours(6).ToUnixTimeSeconds().ToString(),
+            ["ttl"]           = now.AddHours(6).ToUnixTimeSeconds(), // DynamoDB TTL only honours a Number attribute
         });
         return Shared.Ok(JsonSerializer.Serialize(new { status = "connected", room_id = roomId }));
     }
@@ -126,7 +126,7 @@ public sealed class MessageHandler
             ["nickname"]   = message.Nickname,
             ["text"]       = message.Text,
             ["created_at"] = message.CreatedAt,
-            ["ttl"]        = now.AddDays(7).ToUnixTimeSeconds().ToString(),
+            ["ttl"]        = now.AddDays(7).ToUnixTimeSeconds(), // DynamoDB TTL only honours a Number attribute
         });
 
         // Fan-out is a queue, not a call chain: the writer returns instantly.

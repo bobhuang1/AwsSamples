@@ -55,7 +55,7 @@ resource "aws_iam_role_policy" "message" {
       { Effect = "Allow", Action = "logs:CreateLogStream", Resource = aws_cloudwatch_log_group.chat.arn },
       { Effect = "Allow", Action = ["logs:PutLogEvents"], Resource = "${aws_cloudwatch_log_group.chat.arn}:*" },
       { Effect = "Allow", Action = ["dynamodb:PutItem", "dynamodb:GetItem", "dynamodb:UpdateItem", "dynamodb:DeleteItem"],
-      Resource = [aws_dynamodb_table.connections.arn, aws_dynamodb_table.messages.arn] },
+      Resource = [aws_dynamodb_table.connections.arn, aws_dynamodb_table.messages.arn, "${aws_dynamodb_table.connections.arn}/index/*", "${aws_dynamodb_table.messages.arn}/index/*"] },
       { Effect = "Allow", Action = "sqs:SendMessage", Resource = aws_sqs_queue.fanout.arn },
     ]
   })
@@ -78,7 +78,7 @@ resource "aws_iam_role_policy" "fanout" {
       { Effect = "Allow", Action = ["sqs:ReceiveMessage", "sqs:DeleteMessage", "sqs:GetQueueAttributes"],
       Resource = aws_sqs_queue.fanout.arn },
       { Effect = "Allow", Action = ["dynamodb:Query", "dynamodb:DeleteItem", "dynamodb:GetItem"],
-      Resource = [aws_dynamodb_table.connections.arn, aws_dynamodb_table.messages.arn] },
+      Resource = [aws_dynamodb_table.connections.arn, aws_dynamodb_table.messages.arn, "${aws_dynamodb_table.connections.arn}/index/*", "${aws_dynamodb_table.messages.arn}/index/*"] },
       { Effect = "Allow", Action = "execute-api:ManageConnections",
       Resource = aws_apigatewayv2_stage.chat.execution_arn },
     ]

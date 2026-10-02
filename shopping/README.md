@@ -87,3 +87,11 @@ curl "$(terraform output -raw api_endpoint)/products"
   and `Restricted` `placement` for the stack.
 - Cost: under a few dollars/month in dev; scale is almost purely DynamoDB
   RCU/WCU + Lambda invocations.
+
+## Identity
+
+The API Gateway JWT authorizer only proves that *a* shopper is signed in, so the
+handler takes the shopper's id from the token's `sub` claim: `/cart/{userId}` answers
+403 unless `{userId}` is the caller's own `sub`, and `POST /orders` always checks out
+the caller's own cart (a `userId` in the body is ignored). Cart quantities must be
+1-99, and adding a product that is already in the cart raises its quantity.

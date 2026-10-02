@@ -70,3 +70,10 @@ room — messages relay live between them.
 - Rooms vs topics: swap the single GSI for an SNS topic per room to get
   pub/sub semantics and automatic fan-out with FIFO guarantees for
   moderation.
+
+## Security warning: no authentication yet
+
+This sample does not authenticate callers. The WebSocket `$connect` route trusts the `userId` and `nickname` query parameters. Anyone who can reach the endpoint can act
+as any user. Add authentication (for example a Cognito JWT authorizer, or a Lambda
+authorizer for the WebSocket API) and take the user id from the verified token before
+deploying it anywhere public.

@@ -103,7 +103,7 @@ public sealed class MatchmakingHandler
             ["status"]    = "WAITING",
             ["team_size"] = body.TeamSize,
             ["created_at"] = now.ToUnixTimeSeconds().ToString(),
-            ["ttl"]       = now.AddMinutes(10).ToUnixTimeSeconds().ToString(),
+            ["ttl"]       = now.AddMinutes(10).ToUnixTimeSeconds(), // DynamoDB TTL only honours a Number attribute
         });
         return Shared.HttpJson(new { game_id = body.GameId, player_id = body.PlayerId, status = "WAITING" });
     }
@@ -164,7 +164,7 @@ public sealed class MatchmakingHandler
                 ["match_id"]  = matchId,
                 ["team_size"] = slot["team_size"].AsInt(),
                 ["created_at"] = d["created_at"].AsString(),
-                ["ttl"]       = now.AddHours(1).ToUnixTimeSeconds().ToString(),
+                ["ttl"]       = now.AddHours(1).ToUnixTimeSeconds(), // DynamoDB TTL only honours a Number attribute
             });
         await batch.ExecuteAsync();
 

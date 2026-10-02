@@ -60,6 +60,13 @@ resource "aws_dynamodb_table" "orders" {
     type = "S"
   }
 
+  # Range key of user-orders-index. Every index key attribute must be declared; the
+  # handler writes it as a string of epoch seconds.
+  attribute {
+    name = "created_at"
+    type = "S"
+  }
+
   global_secondary_index {
     name            = "user-orders-index"
     hash_key        = "user_id"

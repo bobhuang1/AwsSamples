@@ -109,3 +109,10 @@ aws kinesis put-record --stream-name "<telemetry_stream>" --partition-key "alice
 - Telemetry → Amazon Athena + Tableau/QuickSight for cohort analysis; Kinesis
   Data Firehose for object-partitioned delivery. Add a second consumer (email,
   anti-cheat alarms) without touching the writer.
+
+## Security warning: no authentication yet
+
+This sample does not authenticate callers. The HTTP API has no authorizer, and `playerId` is supplied by the client on join, poll and score submission. Anyone who can reach the endpoint can act
+as any user. Add authentication (for example a Cognito JWT authorizer, or a Lambda
+authorizer for the WebSocket API) and take the user id from the verified token before
+deploying it anywhere public.

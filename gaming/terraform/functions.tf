@@ -33,7 +33,7 @@ resource "aws_iam_role_policy" "http" {
       { Effect = "Allow", Action = "logs:CreateLogStream", Resource = aws_cloudwatch_log_group.game.arn },
       { Effect = "Allow", Action = ["logs:PutLogEvents"], Resource = "${aws_cloudwatch_log_group.game.arn}:*" },
       { Effect = "Allow", Action = ["dynamodb:GetItem", "dynamodb:Query", "dynamodb:PutItem", "dynamodb:UpdateItem", "dynamodb:BatchWriteItem", "dynamodb:DeleteItem"],
-      Resource = [aws_dynamodb_table.players.arn, aws_dynamodb_table.queue.arn, aws_dynamodb_table.matches.arn, aws_dynamodb_table.leaderboard.arn] },
+      Resource = [aws_dynamodb_table.players.arn, aws_dynamodb_table.queue.arn, aws_dynamodb_table.matches.arn, aws_dynamodb_table.leaderboard.arn, "${aws_dynamodb_table.players.arn}/index/*", "${aws_dynamodb_table.queue.arn}/index/*", "${aws_dynamodb_table.matches.arn}/index/*", "${aws_dynamodb_table.leaderboard.arn}/index/*"] },
     ]
   })
 }
@@ -53,7 +53,7 @@ resource "aws_iam_role_policy" "ws" {
       { Effect = "Allow", Action = "logs:CreateLogStream", Resource = aws_cloudwatch_log_group.game.arn },
       { Effect = "Allow", Action = ["logs:PutLogEvents"], Resource = "${aws_cloudwatch_log_group.game.arn}:*" },
       { Effect = "Allow", Action = ["dynamodb:GetItem", "dynamodb:Query", "dynamodb:PutItem", "dynamodb:DeleteItem"],
-      Resource = [aws_dynamodb_table.connections.arn, aws_dynamodb_table.matches.arn] },
+      Resource = [aws_dynamodb_table.connections.arn, aws_dynamodb_table.matches.arn, "${aws_dynamodb_table.connections.arn}/index/*", "${aws_dynamodb_table.matches.arn}/index/*"] },
       { Effect = "Allow", Action = "execute-api:ManageConnections", Resource = aws_apigatewayv2_stage.ws.execution_arn },
     ]
   })

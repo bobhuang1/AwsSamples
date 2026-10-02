@@ -35,7 +35,7 @@ resource "aws_iam_role_policy" "api" {
       { Effect = "Allow", Action = "logs:CreateLogStream", Resource = aws_cloudwatch_log_group.api.arn },
       { Effect = "Allow", Action = ["logs:PutLogEvents"], Resource = "${aws_cloudwatch_log_group.api.arn}:*" },
       { Effect = "Allow", Action = ["dynamodb:GetItem", "dynamodb:Query", "dynamodb:Scan", "dynamodb:PutItem", "dynamodb:UpdateItem", "dynamodb:DeleteItem"],
-      Resource = [aws_dynamodb_table.products.arn, aws_dynamodb_table.carts.arn, aws_dynamodb_table.orders.arn] },
+      Resource = [aws_dynamodb_table.products.arn, aws_dynamodb_table.carts.arn, aws_dynamodb_table.orders.arn, "${aws_dynamodb_table.products.arn}/index/*", "${aws_dynamodb_table.carts.arn}/index/*", "${aws_dynamodb_table.orders.arn}/index/*"] },
       { Effect = "Allow", Action = "sqs:SendMessage", Resource = aws_sqs_queue.orders.arn },
       { Effect = "Allow", Action = "events:PutEvents", Resource = aws_cloudwatch_event_bus.orders.arn },
     ]
@@ -57,7 +57,7 @@ resource "aws_iam_role_policy" "orders" {
       { Effect = "Allow", Action = "logs:CreateLogStream", Resource = aws_cloudwatch_log_group.orders.arn },
       { Effect = "Allow", Action = ["logs:PutLogEvents"], Resource = "${aws_cloudwatch_log_group.orders.arn}:*" },
       { Effect = "Allow", Action = ["dynamodb:GetItem", "dynamodb:UpdateItem"],
-      Resource = aws_dynamodb_table.orders.arn },
+      Resource = [aws_dynamodb_table.orders.arn, "${aws_dynamodb_table.orders.arn}/index/*"] },
       { Effect = "Allow", Action = ["sqs:ReceiveMessage", "sqs:DeleteMessage", "sqs:GetQueueAttributes"],
       Resource = aws_sqs_queue.orders.arn },
       { Effect = "Allow", Action = "states:StartExecution", Resource = aws_sfn_state_machine.orders.arn },
