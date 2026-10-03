@@ -50,7 +50,7 @@ resource "aws_apigatewayv2_api" "shop" {
   cors_configuration {
     allow_origins = ["*"]
     allow_methods = ["GET", "POST", "DELETE"]
-    allow_headers = ["content-type", "authorization"]
+    allow_headers = ["content-type", "authorization", "idempotency-key"]
     max_age       = 300
   }
 }

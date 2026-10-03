@@ -1,12 +1,12 @@
 using System.Net;
+using System.Security.Cryptography;
+using System.Text;
 using System.Text.Json;
 using Amazon.DynamoDBv2;
 using Amazon.DynamoDBv2.DocumentModel;
-using Amazon.EventBridge;
+using Amazon.DynamoDBv2.Model;
 using Amazon.Lambda.APIGatewayEvents;
 using Amazon.Lambda.Core;
-using Amazon.SQS;
-using Amazon.SQS.Model;
 
 [assembly: LambdaSerializer(typeof(Amazon.Lambda.Serialization.SystemTextJson.DefaultLambdaJsonSerializer))]
 
@@ -19,14 +19,10 @@ public sealed class ApiHandler
     private const int MaxQuantityPerLine = 99;
 
     private static readonly Lazy<AmazonDynamoDBClient> Ddb = new(() => new AmazonDynamoDBClient());
-    private static readonly Lazy<AmazonSQSClient> Sqs = new(() => new AmazonSQSClient());
-    private static readonly Lazy<AmazonEventBridgeClient> Events = new(() => new AmazonEventBridgeClient());
 
     private readonly string _productsTable = Env("PRODUCTS_TABLE", "products");
     private readonly string _cartsTable    = Env("CARTS_TABLE", "carts");
     private readonly string _ordersTable   = Env("ORDERS_TABLE", "orders");
-    private readonly string _ordersQueue   = Env("ORDERS_QUEUE_URL", "");
-    private readonly string _eventBus      = Env("ORDER_EVENT_BUS", "orders");
 
     public async Task<APIGatewayHttpApiV2ProxyResponse> Handle(APIGatewayHttpApiV2ProxyRequest request, ILambdaContext context)
     {
@@ -48,7 +44,7 @@ public sealed class ApiHandler
         catch (Exception ex)
         {
             context.Logger.LogError("Handler failure: {0}", ex);
-            return Json(new { error = ex.Message }, HttpStatusCode.InternalServerError);
+            return Json(new { error = "Internal error" }, HttpStatusCode.InternalServerError);
         }
     }
 
@@ -186,11 +182,24 @@ public sealed class ApiHandler
             : new List<CartItem>();
         if (items.Count == 0) return Json(BadRequest("Cart is empty"));
 
-        var orderId = Guid.NewGuid().ToString("N");
+        // An Idempotency-Key header makes checkout safe to retry: the same key from the same
+        // shopper always maps to the same order id, so a retry returns the first order
+        // instead of placing a second one.
+        string? idempotencyKey = null;
+        if (request.Headers?.TryGetValue("idempotency-key", out var rawKey) == true
+            && !string.IsNullOrWhiteSpace(rawKey) && rawKey.Length <= 128)
+        {
+            idempotencyKey = rawKey.Trim();
+        }
+
+        var orderId = idempotencyKey is null ? Guid.NewGuid().ToString("N") : OrderIdFor(userId, idempotencyKey);
+        var orders = Table.LoadTable(Ddb.Value, _ordersTable);
+        if (idempotencyKey is not null && await orders.GetItemAsync(orderId) is { } placed)
+            return PlacedOrder(placed);
+
         var now = DateTimeOffset.UtcNow;
         var order = new Order(orderId, userId, "PLACED", now, items.Sum(i => i.Price * i.Quantity), items);
 
-        var orders = Table.LoadTable(Ddb.Value, _ordersTable);
         var doc = new Document
         {
             ["order_id"]   = orderId,
@@ -199,36 +208,63 @@ public sealed class ApiHandler
             ["created_at"] = now.ToUnixTimeSeconds().ToString(),
             ["total"]      = order.total.ToString("0.00"),
             ["items"]      = items.Select(ItemToDoc).ToList(),
+            // The message the pipeline receives. The orders table stream (OrderWorkflow
+            // PublishOrder) forwards it to SQS and EventBridge, so an order row can never
+            // exist without being processed - there is no second write here that can fail.
+            ["payload"]    = JsonSerializer.Serialize(order, JsonOpts),
             ["ttl"]        = (now.AddDays(30)).ToUnixTimeSeconds(), // DynamoDB TTL only honours a Number attribute
         };
-        await orders.PutItemAsync(doc);
 
-        // Hand the order to the durable checkout pipeline: queue -> worker -> Step Functions.
-        await Sqs.Value.SendMessageAsync(new SendMessageRequest
-        {
-            QueueUrl = _ordersQueue,
-            MessageBody = JsonSerializer.Serialize(order, JsonOpts),
-            MessageGroupId = userId,
-        });
+        // Write the order and empty the cart atomically. The cart delete is conditional on
+        // the cart we priced, so an item added meanwhile isn't silently dropped.
+        (string Expression, Dictionary<string, AttributeValue>? Values) cartCondition = existing!.Contains("updated_at")
+            ? ("updated_at = :u", new Dictionary<string, AttributeValue> { [":u"] = new() { S = existing["updated_at"].AsString() } })
+            : ("attribute_exists(user_id)", null);
 
-        // Announce it on the event bus for downstream consumers (search, BI, email...).
-        await Events.Value.PutEventsAsync(new Amazon.EventBridge.Model.PutEventsRequest
+        try
         {
-            Entries = new List<Amazon.EventBridge.Model.PutEventsRequestEntry>
+            await Ddb.Value.TransactWriteItemsAsync(new TransactWriteItemsRequest
             {
-                new()
-                {
-                    Source = "com.sample.shop",
-                    DetailType = "order.placed",
-                    EventBusName = _eventBus,
-                    Detail = JsonSerializer.Serialize(order, JsonOpts),
-                }
-            }
-        });
+                TransactItems =
+                [
+                    new TransactWriteItem
+                    {
+                        Put = new Put
+                        {
+                            TableName = _ordersTable,
+                            Item = doc.ToAttributeMap(),
+                            ConditionExpression = "attribute_not_exists(order_id)",
+                        },
+                    },
+                    new TransactWriteItem
+                    {
+                        Delete = new Delete
+                        {
+                            TableName = _cartsTable,
+                            Key = new Dictionary<string, AttributeValue> { ["user_id"] = new() { S = userId } },
+                            ConditionExpression = cartCondition.Expression,
+                            ExpressionAttributeValues = cartCondition.Values,
+                        },
+                    },
+                ],
+            });
+        }
+        catch (TransactionCanceledException)
+        {
+            // Either a concurrent retry with the same key won, or the cart changed.
+            if (idempotencyKey is not null && await orders.GetItemAsync(orderId) is { } winner)
+                return PlacedOrder(winner);
+            return Json(new { error = "Your cart changed while checking out. Please try again." }, HttpStatusCode.Conflict);
+        }
 
-        await cart.DeleteItemAsync(userId);
         return Json(new { orderId, total = order.total, status = order.status }, HttpStatusCode.Created);
     }
+
+    private static string OrderIdFor(string userId, string idempotencyKey)
+        => Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes($"{userId}\n{idempotencyKey}")))[..32].ToLowerInvariant();
+
+    private static APIGatewayHttpApiV2ProxyResponse PlacedOrder(Document placed)
+        => Json(new { orderId = Str(placed, "order_id"), total = Str(placed, "total"), status = Str(placed, "status") }, HttpStatusCode.OK);
 
     // ---------------- helpers ----------------
 

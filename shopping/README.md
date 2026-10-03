@@ -15,10 +15,13 @@ Static frontend (S3)
 Browser ──► API Gateway HTTP API ──► ShoppingApi Lambda
               |  (GET /products public; everything else Cognito JWT)          online path
               +--► DynamoDB  products | carts (TTL 7d) | orders (TTL 30d)
-              +--► SQS orders queue (+DLQ) ──► OrderWorkflow.ProcessOrder ──► Step Functions
-                                                                                |
-                                                                   CompleteOrder (marks COMPLETED)
-              +--► EventBridge "orders" bus ──► AuditOrder → S3 audit bucket
+                                                    |
+                                       orders stream ──► OrderWorkflow.PublishOrder (outbox)
+                                                    |
+              SQS orders queue (+DLQ) ◄─────────────+──► OrderWorkflow.ProcessOrder ──► Step Functions
+                                                    |                                   |
+                                                    |                      CompleteOrder (marks COMPLETED)
+              EventBridge "orders" bus ◄────────────+──► AuditOrder → S3 audit bucket
 ```
 
 | Layer | Service | Notes |
@@ -65,9 +68,14 @@ curl "$(terraform output -raw api_endpoint)/products"
 - **Catch-all route + path dispatch.** One `$default` route, one integration,
   one deployment. The handler routes on `RawPath`, which keeps the API Gateway
   route table flat — fine up to hundreds of endpoints.
-- **Async checkout.** Orders go to SQS (90s visibility, 5 max receives) with a
-  DLQ, so a checkout spike never falls over; the worker acknowledges per-item
-  and the pipeline picks the order back up automatically.
+- **Async checkout with an outbox.** `POST /orders` writes the order and
+  deletes the cart in one DynamoDB transaction and nothing else. The orders
+  table stream feeds `PublishOrder`, which sends the order to SQS (90s
+  visibility, 5 max receives, DLQ) and EventBridge, retrying from the stream on
+  failure, so a stored order is always processed. Send an `Idempotency-Key`
+  header to make checkout retries return the original order. Status changes
+  are guarded (`PLACED → PROCESSING → COMPLETED`), so redelivered messages
+  can't move an order backwards.
 - **TTLs everywhere.** Carts expire in 7 days, orders in 30, so the tables stay
   tiny without any janitor code.
 - **Events, not calls.** Checkout emits events on a custom bus; the audit trail,
@@ -82,9 +90,8 @@ curl "$(terraform output -raw api_endpoint)/products"
   machine per region.
 - Auth everywhere: enforce JWT on the public catalog route too, or swap to
   Amazon Verified Permissions for fine-grained ABAC.
-- Checkout hardening: idempotency key on `POST /orders` (a `requestid` hash key
-  with `attribute_not_exists`), a DynamoDB stream consumer driving search/email,
-  and `Restricted` `placement` for the stack.
+- Checkout hardening: more stream consumers (search, email) next to the
+  outbox, and `Restricted` `placement` for the stack.
 - Cost: under a few dollars/month in dev; scale is almost purely DynamoDB
   RCU/WCU + Lambda invocations.
 

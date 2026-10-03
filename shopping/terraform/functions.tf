@@ -36,8 +36,6 @@ resource "aws_iam_role_policy" "api" {
       { Effect = "Allow", Action = ["logs:PutLogEvents"], Resource = "${aws_cloudwatch_log_group.api.arn}:*" },
       { Effect = "Allow", Action = ["dynamodb:GetItem", "dynamodb:Query", "dynamodb:Scan", "dynamodb:PutItem", "dynamodb:UpdateItem", "dynamodb:DeleteItem"],
       Resource = [aws_dynamodb_table.products.arn, aws_dynamodb_table.carts.arn, aws_dynamodb_table.orders.arn, "${aws_dynamodb_table.products.arn}/index/*", "${aws_dynamodb_table.carts.arn}/index/*", "${aws_dynamodb_table.orders.arn}/index/*"] },
-      { Effect = "Allow", Action = "sqs:SendMessage", Resource = aws_sqs_queue.orders.arn },
-      { Effect = "Allow", Action = "events:PutEvents", Resource = aws_cloudwatch_event_bus.orders.arn },
     ]
   })
 }
@@ -58,8 +56,10 @@ resource "aws_iam_role_policy" "orders" {
       { Effect = "Allow", Action = ["logs:PutLogEvents"], Resource = "${aws_cloudwatch_log_group.orders.arn}:*" },
       { Effect = "Allow", Action = ["dynamodb:GetItem", "dynamodb:UpdateItem"],
       Resource = [aws_dynamodb_table.orders.arn, "${aws_dynamodb_table.orders.arn}/index/*"] },
-      { Effect = "Allow", Action = ["sqs:ReceiveMessage", "sqs:DeleteMessage", "sqs:GetQueueAttributes"],
+      { Effect = "Allow", Action = ["sqs:ReceiveMessage", "sqs:DeleteMessage", "sqs:GetQueueAttributes", "sqs:SendMessage"],
       Resource = aws_sqs_queue.orders.arn },
+      { Effect = "Allow", Action = ["dynamodb:DescribeStream", "dynamodb:GetRecords", "dynamodb:GetShardIterator", "dynamodb:ListStreams"],
+      Resource = aws_dynamodb_table.orders.stream_arn },
       { Effect = "Allow", Action = "states:StartExecution", Resource = aws_sfn_state_machine.orders.arn },
       { Effect = "Allow", Action = "events:PutEvents", Resource = aws_cloudwatch_event_bus.orders.arn },
       { Effect = "Allow", Action = ["s3:PutObject"], Resource = "${aws_s3_bucket.audit.arn}/*" },
@@ -81,11 +81,46 @@ resource "aws_lambda_function" "api" {
 
   environment {
     variables = {
-      PRODUCTS_TABLE   = aws_dynamodb_table.products.name
-      CARTS_TABLE      = aws_dynamodb_table.carts.name
-      ORDERS_TABLE     = aws_dynamodb_table.orders.name
+      PRODUCTS_TABLE = aws_dynamodb_table.products.name
+      CARTS_TABLE    = aws_dynamodb_table.carts.name
+      ORDERS_TABLE   = aws_dynamodb_table.orders.name
+    }
+  }
+}
+
+# ---------- Order outbox: orders table stream -> SQS + EventBridge ----------
+# The API only writes the order row (together with the cart delete, in one
+# transaction). This function picks new rows up from the table stream and
+# hands them to the pipeline, so an order can't be stored without being queued.
+
+resource "aws_lambda_function" "orders_outbox" {
+  function_name    = "${local.unique}-orders-outbox"
+  role             = aws_iam_role.orders.arn
+  runtime          = "dotnet8"
+  handler          = "OrderWorkflow::OrderWorkflow.Functions::PublishOrder"
+  filename         = "${path.module}/dist/OrderWorkflow.zip"
+  source_code_hash = filebase64sha256("${path.module}/dist/OrderWorkflow.zip")
+  timeout          = 60
+  memory_size      = 256
+
+  environment {
+    variables = {
       ORDERS_QUEUE_URL = aws_sqs_queue.orders.id
       ORDER_EVENT_BUS  = aws_cloudwatch_event_bus.orders.name
+    }
+  }
+}
+
+resource "aws_lambda_event_source_mapping" "orders_outbox" {
+  event_source_arn        = aws_dynamodb_table.orders.stream_arn
+  function_name           = aws_lambda_function.orders_outbox.arn
+  starting_position       = "TRIM_HORIZON"
+  batch_size              = 10
+  function_response_types = ["ReportBatchItemFailures"]
+
+  filter_criteria {
+    filter {
+      pattern = jsonencode({ eventName = ["INSERT"] })
     }
   }
 }
