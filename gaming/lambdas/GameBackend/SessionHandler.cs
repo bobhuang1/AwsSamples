@@ -39,20 +39,29 @@ public sealed class SessionHandler
         catch (Exception ex)
         {
             context.Logger.LogError("WS failure: {0}", ex);
-            return new APIGatewayProxyResponse { StatusCode = 500, Body = ex.Message };
+            return new APIGatewayProxyResponse { StatusCode = 500, Body = "internal error" };
         }
     }
 
     private async Task<APIGatewayProxyResponse> OnConnect(APIGatewayProxyRequest request, string connectionId)
     {
-        string? playerIdRaw = null, matchIdRaw = null;
-        if (request.QueryStringParameters is not null)
-        {
-            request.QueryStringParameters.TryGetValue("playerId", out playerIdRaw);
-            request.QueryStringParameters.TryGetValue("matchId", out matchIdRaw);
-        }
-        var playerId = playerIdRaw ?? "anon";
-        var matchId = matchIdRaw ?? "";
+        // The player is whoever the Cognito token (checked by ConnectAuthorizer) says,
+        // and they may only join the live channel of a match they are actually in.
+        var playerId = ConnectAuthorizer.FromContext(request, "userId");
+        if (string.IsNullOrEmpty(playerId))
+            return new APIGatewayProxyResponse { StatusCode = 401, Body = "not authorized" };
+
+        string? matchId = null;
+        request.QueryStringParameters?.TryGetValue("matchId", out matchId);
+        if (string.IsNullOrEmpty(matchId))
+            return new APIGatewayProxyResponse { StatusCode = 400, Body = "query param matchId required" };
+
+        var match = await Table.LoadTable(Shared.Ddb.Value, _matchesTable).GetItemAsync(matchId);
+        var players = match is not null && match.Contains("players") && match["players"] is PrimitiveList pl
+            ? pl.Entries.Select(e => e.AsString()).ToList()
+            : new List<string>();
+        if (!players.Contains(playerId))
+            return new APIGatewayProxyResponse { StatusCode = 403, Body = "not a player in this match" };
 
         var now = DateTimeOffset.UtcNow;
         var table = Table.LoadTable(Shared.Ddb.Value, _connectionsTable);
@@ -79,13 +88,16 @@ public sealed class SessionHandler
         using var body = JsonDocument.Parse(request.Body ?? "{}");
         var root = body.RootElement;
 
-        var matchId = root.GetProperty("matchId").GetString();
-        var action = root.GetProperty("action").GetString();
+        var action = root.TryGetProperty("action", out var a) ? a.GetString() : null;
         var payload = root.TryGetProperty("payload", out var p) ? p.GetRawText() : "{}";
-        var fromId = root.TryGetProperty("fromPlayer", out var fp) ? fp.GetString() : null;
 
+        // Sender and match come from the connection record written at $connect, not from
+        // the message body, so a client cannot speak for another player or another match.
         var sender = await Table.LoadTable(Shared.Ddb.Value, _connectionsTable).GetItemAsync(connectionId);
-        var senderId = fromId ?? (sender?.Contains("player_id") == true ? sender!["player_id"].AsString() : "anon");
+        if (sender is null || !sender.Contains("player_id") || !sender.Contains("match_id"))
+            return new APIGatewayProxyResponse { StatusCode = 401, Body = "not connected" };
+        var senderId = sender["player_id"].AsString();
+        var matchId = sender["match_id"].AsString();
 
         // Relay to everyone else in the match.
         var connections = Table.LoadTable(Shared.Ddb.Value, _connectionsTable);

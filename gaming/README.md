@@ -46,36 +46,48 @@ terraform apply     # outputs the HTTP + WebSocket endpoints
 
 ## Try it
 
+Both APIs need a Cognito **ID token**. Create a test user and sign in with
+the AWS CLI (`terraform output` prints the pool and client ids):
+
+```powershell
+$pool   = (terraform output -raw cognito_pool_id)
+$client = (terraform output -raw cognito_client_id)
+
+aws cognito-idp admin-create-user --user-pool-id $pool --username alice --temporary-password 'TempPass1!' --message-action SUPPRESS
+aws cognito-idp admin-set-user-password --user-pool-id $pool --username alice --password 'YourPass1!' --permanent
+$token = (aws cognito-idp initiate-auth --client-id $client --auth-flow alice_PASSWORD_AUTH `
+  --auth-parameters aliceNAME=alice,PASSWORD='YourPass1!' --query AuthenticationResult.IdToken --output text)
+```
+
+Repeat for a second user (`bob`, `$tokenBob`). The player id is the token's
+`sub` claim; requests never name the player themselves.
+
 ```powershell
 $api   = (terraform output -raw api_endpoint)
 $ws    = (terraform output -raw ws_endpoint)   # wss://...
+$auth  = @{ Authorization = "Bearer $token" }
 
-# register two players
-curl -X POST "$api/players" -d '{"playerId":"alice","displayName":"Alice"}'
-curl -X POST "$api/players" -d '{"playerId":"bob","displayName":"Bob"}'
-
-# both join a 2-player lobby
-curl -X POST "$api/matches/queue" -d '{"playerId":"alice","gameId":"duel","teamSize":2}'
-curl -X POST "$api/matches/queue" -d '{"playerId":"bob","gameId":"duel","teamSize":2}'
+# register, then join a 2-player lobby (repeat with bob's token)
+Invoke-RestMethod -Method Post "$api/players" -Headers $auth -Body '{"displayName":"Alice"}'
+Invoke-RestMethod -Method Post "$api/matches/queue" -Headers $auth -Body '{"gameId":"duel","teamSize":2}'
 
 # poll until a match forms
-curl "$api/matches/queue/duel/alice"
-curl "$api/matches/queue/duel/bob"
+Invoke-RestMethod "$api/matches/queue/duel" -Headers $auth
 
-# record a score, read the leaderboard
-curl -X POST "$api/leaderboard/alice/score" -d '{"score":1200}'
-curl -X POST "$api/leaderboard/bob/score"   -d '{"score":900}'
-curl "$api/leaderboard/top"
+# record your own score (the path id must be your sub); the leaderboard is public
+Invoke-RestMethod -Method Post "$api/leaderboard/<your sub>/score" -Headers $auth -Body '{"score":1200}'
+Invoke-RestMethod "$api/leaderboard/top"
 ```
 
 For the live relay, connect two browsers to `$ws` with
-`?playerId=alice&matchId=<matchId>` and send
+`?token=<ID token>&matchId=<matchId>` (only players in that match are let in)
+and send
 
 ```json
-{ "action": "move", "matchId": "<matchId>", "payload": { "x": 10, "y": 20 } }
+{ "action": "move", "payload": { "x": 10, "y": 20 } }
 ```
 
-— the other connection receives `{ "action": "move", "from_player": "alice", "payload": {...} }`.
+— the other connection receives `{ "action": "move", "from_player": "<sender sub>", "payload": {...} }`.
 
 Feed the telemetry stream from your game clients:
 
@@ -110,9 +122,16 @@ aws kinesis put-record --stream-name "<telemetry_stream>" --partition-key "alice
   Data Firehose for object-partitioned delivery. Add a second consumer (email,
   anti-cheat alarms) without touching the writer.
 
-## Security warning: no authentication yet
+## Security notes
 
-This sample does not authenticate callers. The HTTP API has no authorizer, and `playerId` is supplied by the client on join, poll and score submission. Anyone who can reach the endpoint can act
-as any user. Add authentication (for example a Cognito JWT authorizer, or a Lambda
-authorizer for the WebSocket API) and take the user id from the verified token before
-deploying it anywhere public.
+- **Sign-in.** A Cognito user pool issues the tokens. The HTTP API uses a JWT
+  authorizer on every route except `GET /leaderboard/top`; the WebSocket
+  `$connect` route uses a Lambda REQUEST authorizer (`ConnectAuthorizer`)
+  that validates the ID token passed as `?token=`, because browsers cannot set
+  headers on a WebSocket handshake. Handlers take the player id from the token.
+- **Matchmaking** only counts `WAITING` slots, takes exactly `teamSize`
+  players, and claims them in one DynamoDB transaction conditioned on
+  `status = WAITING`, so concurrent polls cannot put a player in two matches.
+- **Scores are still client-reported.** A player can only post their own
+  score, but nothing stops them posting a fake one. A real game computes
+  scores on the server (or validates them from telemetry).

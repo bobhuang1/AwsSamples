@@ -7,7 +7,7 @@ resource "aws_apigatewayv2_api" "http" {
   cors_configuration {
     allow_origins = ["*"]
     allow_methods = ["GET", "POST"]
-    allow_headers = ["content-type"]
+    allow_headers = ["content-type", "authorization"]
     max_age       = 300
   }
 }
@@ -19,10 +19,32 @@ resource "aws_apigatewayv2_integration" "http" {
   payload_format_version = "2.0"
 }
 
-resource "aws_apigatewayv2_route" "http" {
+# Public leaderboard; every other route needs a Cognito ID token, and the
+# handler takes the player id from its "sub" claim.
+resource "aws_apigatewayv2_route" "leaderboard_public" {
   api_id    = aws_apigatewayv2_api.http.id
-  route_key = "$default"
+  route_key = "GET /leaderboard/top"
   target    = "integrations/${aws_apigatewayv2_integration.http.id}"
+}
+
+resource "aws_apigatewayv2_authorizer" "jwt" {
+  api_id           = aws_apigatewayv2_api.http.id
+  authorizer_type  = "JWT"
+  identity_sources = ["$request.header.Authorization"]
+  name             = "player-jwt"
+
+  jwt_configuration {
+    audience = [aws_cognito_user_pool_client.web.id]
+    issuer   = local.jwt_issuer
+  }
+}
+
+resource "aws_apigatewayv2_route" "http" {
+  api_id             = aws_apigatewayv2_api.http.id
+  route_key          = "$default"
+  target             = "integrations/${aws_apigatewayv2_integration.http.id}"
+  authorization_type = "JWT"
+  authorizer_id      = aws_apigatewayv2_authorizer.jwt.id
 }
 
 resource "aws_apigatewayv2_deployment" "http" {
@@ -31,10 +53,11 @@ resource "aws_apigatewayv2_deployment" "http" {
   triggers = {
     redeployment = sha1(join(",", [
       aws_apigatewayv2_integration.http.id,
+      aws_apigatewayv2_route.leaderboard_public.id,
       aws_apigatewayv2_route.http.id,
     ]))
   }
-  depends_on = [aws_apigatewayv2_route.http]
+  depends_on = [aws_apigatewayv2_route.http, aws_apigatewayv2_route.leaderboard_public]
 }
 
 resource "aws_apigatewayv2_stage" "http" {
@@ -67,9 +90,11 @@ resource "aws_apigatewayv2_integration" "ws" {
 }
 
 resource "aws_apigatewayv2_route" "connect" {
-  api_id    = aws_apigatewayv2_api.ws.id
-  route_key = "$connect"
-  target    = "integrations/${aws_apigatewayv2_integration.ws.id}"
+  api_id             = aws_apigatewayv2_api.ws.id
+  route_key          = "$connect"
+  target             = "integrations/${aws_apigatewayv2_integration.ws.id}"
+  authorization_type = "CUSTOM"
+  authorizer_id      = aws_apigatewayv2_authorizer.connect.id
 }
 
 resource "aws_apigatewayv2_route" "disconnect" {
@@ -90,6 +115,7 @@ resource "aws_apigatewayv2_deployment" "ws" {
   triggers = {
     redeployment = sha1(join(",", [
       aws_apigatewayv2_integration.ws.id,
+      aws_apigatewayv2_authorizer.connect.id,
       aws_apigatewayv2_route.connect.id,
       aws_apigatewayv2_route.disconnect.id,
       aws_apigatewayv2_route.default.id,

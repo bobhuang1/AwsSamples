@@ -52,21 +52,28 @@ public sealed class MessageHandler
         catch (Exception ex)
         {
             context.Logger.LogError("WS failure: {0}", ex);
-            return Shared.Fail(500, ex.Message);
+            return Shared.Fail(500, "internal error");
         }
     }
 
     private async Task<APIGatewayProxyResponse> OnConnect(APIGatewayProxyRequest request, string connectionId)
     {
-        string? userId = null, nickname = null, roomId = null;
+        // Identity comes from the validated Cognito token (ConnectAuthorizer), never
+        // from the query string; only the room and a display nickname are client-chosen.
+        var userId = ConnectAuthorizer.FromContext(request, "userId");
+        if (string.IsNullOrEmpty(userId))
+            return Shared.Fail(401, "not authorized");
+
+        string? nickname = null, roomId = null;
         if (request.QueryStringParameters is not null)
         {
-            request.QueryStringParameters.TryGetValue("userId", out userId);
             request.QueryStringParameters.TryGetValue("nickname", out nickname);
             request.QueryStringParameters.TryGetValue("roomId", out roomId);
         }
-        if (string.IsNullOrEmpty(roomId) || string.IsNullOrEmpty(userId))
-            return Shared.Fail(401, "query params userId + roomId (+ optional nickname) required");
+        if (string.IsNullOrEmpty(roomId) || roomId.Length > 64)
+            return Shared.Fail(400, "query param roomId (+ optional nickname) required");
+        if (string.IsNullOrWhiteSpace(nickname) || nickname.Length > 40)
+            nickname = ConnectAuthorizer.FromContext(request, "userName") ?? userId;
 
         var now = DateTimeOffset.UtcNow;
         var table = Table.LoadTable(Shared.Ddb.Value, _connectionsTable);
@@ -74,7 +81,7 @@ public sealed class MessageHandler
         {
             ["connection_id"] = connectionId,
             ["user_id"]       = userId,
-            ["nickname"]      = string.IsNullOrEmpty(nickname) ? userId : nickname,
+            ["nickname"]      = nickname,
             ["room_id"]       = roomId,
             ["connected_at"]  = now.ToUnixTimeSeconds().ToString(),
             ["ttl"]           = now.AddHours(6).ToUnixTimeSeconds(), // DynamoDB TTL only honours a Number attribute

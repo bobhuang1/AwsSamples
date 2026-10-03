@@ -15,3 +15,11 @@ output "telemetry_stream" {
 output "telemetry_bucket" {
   value = aws_s3_bucket.telemetry.id
 }
+
+output "cognito_pool_id" {
+  value = aws_cognito_user_pool.users.id
+}
+
+output "cognito_client_id" {
+  value = aws_cognito_user_pool_client.web.id
+}

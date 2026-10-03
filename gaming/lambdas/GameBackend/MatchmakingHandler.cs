@@ -3,6 +3,7 @@ using System.Text;
 using System.Text.Json;
 using Amazon.DynamoDBv2;
 using Amazon.DynamoDBv2.DocumentModel;
+using Amazon.DynamoDBv2.Model;
 using Amazon.Lambda.APIGatewayEvents;
 using Amazon.Lambda.Core;
 
@@ -44,39 +45,62 @@ public sealed class MatchmakingHandler
         {
             var (method, path) = (request.RequestContext.Http.Method, request.RawPath);
 
+            if ((method, path) == ("GET", "/leaderboard/top"))
+                return await TopScores(request); // the only public route (see api.tf)
+
+            // Everything else sits behind the Cognito JWT authorizer; the player is the
+            // token's subject, never an id taken from the path or body.
+            var caller = CallerId(request);
+            if (caller is null)
+                return Shared.HttpJson(new { error = "Unauthorized" }, HttpStatusCode.Unauthorized);
+
             return (method, path) switch
             {
-                ("POST", "/players")                              => await RegisterPlayer(request),
+                ("POST", "/players")                              => await RegisterPlayer(request, caller),
                 ("GET", _) when path.StartsWith("/players/")       => await GetPlayer(path),
-                ("POST", "/matches/queue")                         => await JoinQueue(request),
-                ("GET", _) when path.StartsWith("/matches/queue/") => await PollQueue(path),
-                ("POST", _) when path.StartsWith("/leaderboard/")  => await RecordScore(path, request),
-                ("GET", "/leaderboard/top")                        => await TopScores(request),
+                ("POST", "/matches/queue")                         => await JoinQueue(request, caller),
+                ("GET", _) when path.StartsWith("/matches/queue/") => await PollQueue(path, caller),
+                ("POST", _) when path.StartsWith("/leaderboard/")  => await RecordScore(path, request, caller),
                 _                                                  => Shared.HttpJson(new { error = "Not found" }, HttpStatusCode.NotFound),
             };
+        }
+        catch (Exception ex) when (ex is JsonException or InvalidOperationException)
+        {
+            return Shared.HttpJson(new { error = ex.Message }, HttpStatusCode.BadRequest);
         }
         catch (Exception ex)
         {
             context.Logger.LogError("Handler failure: {0}", ex);
-            return Shared.HttpJson(new { error = ex.Message }, HttpStatusCode.InternalServerError);
+            return Shared.HttpJson(new { error = "Internal error" }, HttpStatusCode.InternalServerError);
         }
     }
 
-    private async Task<APIGatewayHttpApiV2ProxyResponse> RegisterPlayer(APIGatewayHttpApiV2ProxyRequest request)
+    private static string? CallerId(APIGatewayHttpApiV2ProxyRequest request)
+        => request.RequestContext?.Authorizer?.Jwt?.Claims is { } claims
+           && claims.TryGetValue("sub", out var sub) && !string.IsNullOrEmpty(sub)
+            ? sub
+            : null;
+
+    private static APIGatewayHttpApiV2ProxyResponse Forbidden()
+        => Shared.HttpJson(new { error = "You can only act as yourself." }, HttpStatusCode.Forbidden);
+
+    private async Task<APIGatewayHttpApiV2ProxyResponse> RegisterPlayer(APIGatewayHttpApiV2ProxyRequest request, string playerId)
     {
-        var body = JsonSerializer.Deserialize<RegisterRequest>(request.Body, Shared.JsonOpts)
-            ?? throw new InvalidOperationException("Body must be { playerId, displayName }");
+        var body = JsonSerializer.Deserialize<RegisterRequest>(request.Body ?? "", Shared.JsonOpts)
+            ?? throw new InvalidOperationException("Body must be { displayName }");
+        if (string.IsNullOrWhiteSpace(body.DisplayName) || body.DisplayName.Length > 40)
+            throw new InvalidOperationException("displayName must be 1-40 characters");
 
         var table = Table.LoadTable(Shared.Ddb.Value, _playersTable);
         await table.PutItemAsync(new Document
         {
-            ["player_id"] = body.PlayerId,
+            ["player_id"] = playerId,
             ["display_name"] = body.DisplayName,
             ["games_played"] = 0,
             ["wins"] = 0,
             ["created_at"] = DateTimeOffset.UtcNow.ToUnixTimeSeconds().ToString(),
         });
-        return Shared.HttpJson(new { player_id = body.PlayerId, display_name = body.DisplayName });
+        return Shared.HttpJson(new { player_id = playerId, display_name = body.DisplayName });
     }
 
     private async Task<APIGatewayHttpApiV2ProxyResponse> GetPlayer(string path)
@@ -89,32 +113,41 @@ public sealed class MatchmakingHandler
             : Shared.HttpJson(PlayerView.From(doc), HttpStatusCode.OK);
     }
 
-    private async Task<APIGatewayHttpApiV2ProxyResponse> JoinQueue(APIGatewayHttpApiV2ProxyRequest request)
+    private async Task<APIGatewayHttpApiV2ProxyResponse> JoinQueue(APIGatewayHttpApiV2ProxyRequest request, string playerId)
     {
-        var body = JsonSerializer.Deserialize<JoinQueueRequest>(request.Body, Shared.JsonOpts)
-            ?? throw new InvalidOperationException("Body must be { playerId, gameId, teamSize }");
+        var body = JsonSerializer.Deserialize<JoinQueueRequest>(request.Body ?? "", Shared.JsonOpts)
+            ?? throw new InvalidOperationException("Body must be { gameId, teamSize }");
+        if (string.IsNullOrWhiteSpace(body.GameId) || body.GameId.Length > 64)
+            throw new InvalidOperationException("gameId must be 1-64 characters");
+        if (body.TeamSize is < MinTeamSize or > MaxTeamSize)
+            throw new InvalidOperationException($"teamSize must be {MinTeamSize}-{MaxTeamSize}");
 
         var table = Table.LoadTable(Shared.Ddb.Value, _queueTable);
         var now = DateTimeOffset.UtcNow;
         await table.PutItemAsync(new Document
         {
             ["game_id"]   = body.GameId,
-            ["player_id"] = body.PlayerId,
+            ["player_id"] = playerId,
             ["status"]    = "WAITING",
             ["team_size"] = body.TeamSize,
             ["created_at"] = now.ToUnixTimeSeconds().ToString(),
             ["ttl"]       = now.AddMinutes(10).ToUnixTimeSeconds(), // DynamoDB TTL only honours a Number attribute
         });
-        return Shared.HttpJson(new { game_id = body.GameId, player_id = body.PlayerId, status = "WAITING" });
+        return Shared.HttpJson(new { game_id = body.GameId, player_id = playerId, status = "WAITING" });
     }
 
-    private async Task<APIGatewayHttpApiV2ProxyResponse> PollQueue(string path)
-    {
-        // /matches/queue/{gameId}/{playerId}
-        var gameId = Shared.Segment(path, 2);
-        var playerId = Shared.Segment(path, 3);
-        var queue = Table.LoadTable(Shared.Ddb.Value, _queueTable);
+    private const int MinTeamSize = 2;
+    private const int MaxTeamSize = 10;
 
+    private async Task<APIGatewayHttpApiV2ProxyResponse> PollQueue(string path, string playerId)
+    {
+        // /matches/queue/{gameId}[/{playerId}] - the optional player segment must be the caller.
+        var segments = path.Split('/', StringSplitOptions.RemoveEmptyEntries);
+        var gameId = Shared.Segment(path, 2);
+        if (segments.Length > 3 && Shared.Segment(path, 3) != playerId)
+            return Forbidden();
+
+        var queue = Table.LoadTable(Shared.Ddb.Value, _queueTable);
         var slot = await queue.GetItemAsync(gameId, playerId);
         if (slot is null)
             return Shared.HttpJson(new { status = "NOT_QUEUED", game_id = gameId, player_id = playerId });
@@ -123,50 +156,106 @@ public sealed class MatchmakingHandler
         if (slot["status"].AsString() == "READY" && slot.Contains("match_id"))
             return await MatchView(slot["match_id"].AsString());
 
-        // Lobby full yet? Query the whole game partition and count.
-        var search = await queue.Query(new QueryOperationConfig
+        // Lobby full yet? Only unexpired WAITING slots for the same team size count;
+        // READY slots from earlier matches stay in the partition until their TTL.
+        var teamSize = slot["team_size"].AsInt();
+        var now = DateTimeOffset.UtcNow;
+        var waiting = await queue.Query(new QueryOperationConfig
         {
-            IndexName = null,
             KeyExpression = new Expression
             {
                 ExpressionStatement = "game_id = :g",
                 ExpressionAttributeValues = new Dictionary<string, DynamoDBEntry> { [":g"] = gameId },
             },
-            Limit  = 100,
+            FilterExpression = new Expression
+            {
+                ExpressionStatement = "#st = :w AND team_size = :n AND #t > :now",
+                ExpressionAttributeNames = new Dictionary<string, string> { ["#st"] = "status", ["#t"] = "ttl" },
+                ExpressionAttributeValues = new Dictionary<string, DynamoDBEntry>
+                {
+                    [":w"] = "WAITING",
+                    [":n"] = teamSize,
+                    [":now"] = now.ToUnixTimeSeconds(),
+                },
+            },
             Select = SelectValues.AllAttributes,
         }).GetRemainingAsync();
 
-        if (search.Count < slot["team_size"].AsInt())
-            return Shared.HttpJson(new { status = "WAITING", game_id = gameId, player_id = playerId, queued = search.Count, needed = slot["team_size"].AsInt() });
+        if (waiting.Count < teamSize)
+            return Shared.HttpJson(new { status = "WAITING", game_id = gameId, player_id = playerId, queued = waiting.Count, needed = teamSize });
 
-        // Full: create the match and mark every slot READY with the same match id.
+        // Full: take exactly teamSize players - the caller plus the longest-waiting others.
+        var players = waiting
+            .Select(d => (Id: d["player_id"].AsString(), CreatedAt: d.Contains("created_at") ? d["created_at"].AsString() : ""))
+            .Where(p => p.Id != playerId)
+            .OrderBy(p => p.CreatedAt, StringComparer.Ordinal).ThenBy(p => p.Id, StringComparer.Ordinal)
+            .Take(teamSize - 1)
+            .Select(p => p.Id)
+            .Append(playerId)
+            .OrderBy(p => p, StringComparer.Ordinal)
+            .ToList();
+
+        // Claim every slot and create the match in one transaction. Each slot update is
+        // conditional on status = WAITING, so two concurrent polls cannot both claim a
+        // player: the loser's transaction is cancelled and it simply reports its state.
         var matchId = Guid.NewGuid().ToString("N");
-        var players = search.Select(d => d["player_id"].AsString()).OrderBy(p => p).ToList();
-        var now = DateTimeOffset.UtcNow;
-
-        var matches = Table.LoadTable(Shared.Ddb.Value, _matchesTable);
-        await matches.PutItemAsync(new Document
+        var claim = new TransactWriteItemsRequest
         {
-            ["match_id"]   = matchId,
-            ["game_id"]    = gameId,
-            ["status"]     = "ACTIVE",
-            ["players"]    = players,
-            ["created_at"] = now.ToUnixTimeSeconds().ToString(),
-        });
+            TransactItems =
+            [
+                new TransactWriteItem
+                {
+                    Put = new Put
+                    {
+                        TableName = _matchesTable,
+                        Item = new Dictionary<string, AttributeValue>
+                        {
+                            ["match_id"]   = new() { S = matchId },
+                            ["game_id"]    = new() { S = gameId },
+                            ["status"]     = new() { S = "ACTIVE" },
+                            ["players"]    = new() { SS = players },
+                            ["created_at"] = new() { S = now.ToUnixTimeSeconds().ToString() },
+                        },
+                        ConditionExpression = "attribute_not_exists(match_id)",
+                    },
+                },
+                .. players.Select(p => new TransactWriteItem
+                {
+                    Update = new Update
+                    {
+                        TableName = _queueTable,
+                        Key = new Dictionary<string, AttributeValue>
+                        {
+                            ["game_id"]   = new() { S = gameId },
+                            ["player_id"] = new() { S = p },
+                        },
+                        UpdateExpression = "SET #st = :r, match_id = :m, #t = :t",
+                        ConditionExpression = "#st = :w",
+                        ExpressionAttributeNames = new Dictionary<string, string> { ["#st"] = "status", ["#t"] = "ttl" },
+                        ExpressionAttributeValues = new Dictionary<string, AttributeValue>
+                        {
+                            [":r"] = new() { S = "READY" },
+                            [":w"] = new() { S = "WAITING" },
+                            [":m"] = new() { S = matchId },
+                            [":t"] = new() { N = now.AddHours(1).ToUnixTimeSeconds().ToString() }, // TTL must be a Number
+                        },
+                    },
+                }),
+            ],
+        };
 
-        var batch = queue.CreateBatchWrite();
-        foreach (var d in search)
-            batch.AddDocumentToPut(new Document
-            {
-                ["game_id"]   = gameId,
-                ["player_id"] = d["player_id"].AsString(),
-                ["status"]    = "READY",
-                ["match_id"]  = matchId,
-                ["team_size"] = slot["team_size"].AsInt(),
-                ["created_at"] = d["created_at"].AsString(),
-                ["ttl"]       = now.AddHours(1).ToUnixTimeSeconds(), // DynamoDB TTL only honours a Number attribute
-            });
-        await batch.ExecuteAsync();
+        try
+        {
+            await Shared.Ddb.Value.TransactWriteItemsAsync(claim);
+        }
+        catch (TransactionCanceledException)
+        {
+            // Another poll claimed at least one of these players first.
+            var fresh = await queue.GetItemAsync(gameId, playerId);
+            if (fresh is not null && fresh["status"].AsString() == "READY" && fresh.Contains("match_id"))
+                return await MatchView(fresh["match_id"].AsString());
+            return Shared.HttpJson(new { status = "WAITING", game_id = gameId, player_id = playerId, needed = teamSize });
+        }
 
         return await MatchView(matchId);
     }
@@ -182,34 +271,46 @@ public sealed class MatchmakingHandler
         return Shared.HttpJson(new MatchView(matchId, doc["game_id"].AsString(), doc["status"].AsString(), players));
     }
 
-    private async Task<APIGatewayHttpApiV2ProxyResponse> RecordScore(string path, APIGatewayHttpApiV2ProxyRequest request)
+    private async Task<APIGatewayHttpApiV2ProxyResponse> RecordScore(string path, APIGatewayHttpApiV2ProxyRequest request, string caller)
     {
-        // /leaderboard/{playerId}/score
+        // /leaderboard/{playerId}/score - players can only post their own score. The score
+        // itself is still client-reported; a real game would compute it server-side.
         var playerId = Shared.Segment(path, 1);
-        var body = JsonSerializer.Deserialize<ScoreRequest>(request.Body, Shared.JsonOpts)
+        if (playerId != caller)
+            return Forbidden();
+        var body = JsonSerializer.Deserialize<ScoreRequest>(request.Body ?? "", Shared.JsonOpts)
             ?? throw new InvalidOperationException("Body must be { score }");
+        if (body.Score < 0)
+            throw new InvalidOperationException("score must not be negative");
 
-        await Shared.Ddb.Value.UpdateItemAsync(new Amazon.DynamoDBv2.Model.UpdateItemRequest
+        try
         {
-            TableName = _leaderboard,
-            Key = new Dictionary<string, Amazon.DynamoDBv2.Model.AttributeValue>
+            await Shared.Ddb.Value.UpdateItemAsync(new UpdateItemRequest
             {
-                ["player_id"] = new() { S = playerId },
-            },
-            UpdateExpression = "SET #s = :s, #b = :b, #u = :u ADD games_played :one",
-            ConditionExpression = "attribute_not_exists(#s) OR #s < :s",
-            ExpressionAttributeNames = new Dictionary<string, string>
-            {
-                ["#s"] = "score", ["#b"] = "board", ["#u"] = "updated_at",
-            },
-            ExpressionAttributeValues = new Dictionary<string, Amazon.DynamoDBv2.Model.AttributeValue>
-            {
-                [":s"] = new() { N = body.Score.ToString() },
-                [":b"] = new() { S = "global" },
-                [":u"] = new() { N = DateTimeOffset.UtcNow.ToUnixTimeSeconds().ToString() },
-                [":one"] = new() { N = "1" },
-            },
-        });
+                TableName = _leaderboard,
+                Key = new Dictionary<string, AttributeValue>
+                {
+                    ["player_id"] = new() { S = playerId },
+                },
+                UpdateExpression = "SET #s = :s, #b = :b, #u = :u ADD games_played :one",
+                ConditionExpression = "attribute_not_exists(#s) OR #s < :s",
+                ExpressionAttributeNames = new Dictionary<string, string>
+                {
+                    ["#s"] = "score", ["#b"] = "board", ["#u"] = "updated_at",
+                },
+                ExpressionAttributeValues = new Dictionary<string, AttributeValue>
+                {
+                    [":s"] = new() { N = body.Score.ToString() },
+                    [":b"] = new() { S = "global" },
+                    [":u"] = new() { N = DateTimeOffset.UtcNow.ToUnixTimeSeconds().ToString() },
+                    [":one"] = new() { N = "1" },
+                },
+            });
+        }
+        catch (ConditionalCheckFailedException)
+        {
+            // Not a new personal best; the stored score stays.
+        }
 
         return Shared.HttpJson(new { player_id = playerId, score = body.Score, board = "global" });
     }
@@ -248,6 +349,6 @@ public sealed record PlayerView(string player_id, string? display_name, int game
 
 public sealed record MatchView(string match_id, string game_id, string status, IReadOnlyList<string> players);
 public sealed record ScoreRow(string player_id, int score);
-public sealed record RegisterRequest(string PlayerId, string DisplayName);
-public sealed record JoinQueueRequest(string PlayerId, string GameId, int TeamSize);
+public sealed record RegisterRequest(string DisplayName);
+public sealed record JoinQueueRequest(string GameId, int TeamSize);
 public sealed record ScoreRequest(int Score);

@@ -8,7 +8,7 @@ A WebSocket chat service that separates the *write* path (fast, cheap) from the
 ```
 browser (client/chat.html)
    │
-   │  wss://…/v1  (nickname,userId,roomId query params)
+   │  wss://…/v1  (token,roomId,nickname query params)
    ▼
 WebSocket API ($connect / $default / $disconnect)
    │
@@ -39,9 +39,22 @@ terraform init
 terraform apply        # prints the wss:// endpoint
 ```
 
-Open `client/chat.html`, paste the endpoint, pick a nickname and room, and
-connect. Open the same file in a second tab with another nickname in the same
-room — messages relay live between them.
+Both APIs need a Cognito **ID token**. Create a test user and sign in with
+the AWS CLI (`terraform output` prints the pool and client ids):
+
+```powershell
+$pool   = (terraform output -raw cognito_pool_id)
+$client = (terraform output -raw cognito_client_id)
+
+aws cognito-idp admin-create-user --user-pool-id $pool --username alice --temporary-password 'TempPass1!' --message-action SUPPRESS
+aws cognito-idp admin-set-user-password --user-pool-id $pool --username alice --password 'YourPass1!' --permanent
+$token = (aws cognito-idp initiate-auth --client-id $client --auth-flow alice_PASSWORD_AUTH `
+  --auth-parameters aliceNAME=alice,PASSWORD='YourPass1!' --query AuthenticationResult.IdToken --output text)
+```
+
+Open `client/chat.html`, paste the endpoint and the ID token, pick a nickname
+and room, and connect. Sign in as a second user in another tab and join the
+same room — messages relay live between them.
 
 ## The "large scale" bits
 
@@ -71,9 +84,11 @@ room — messages relay live between them.
   pub/sub semantics and automatic fan-out with FIFO guarantees for
   moderation.
 
-## Security warning: no authentication yet
+## Security notes
 
-This sample does not authenticate callers. The WebSocket `$connect` route trusts the `userId` and `nickname` query parameters. Anyone who can reach the endpoint can act
-as any user. Add authentication (for example a Cognito JWT authorizer, or a Lambda
-authorizer for the WebSocket API) and take the user id from the verified token before
-deploying it anywhere public.
+The `$connect` route uses a Lambda REQUEST authorizer (`ConnectAuthorizer`)
+that validates a Cognito ID token passed as `?token=` (browsers cannot set
+headers on a WebSocket handshake). The user id stored for the connection is the
+token's `sub`; the nickname is only a display name. Tokens in query strings can
+end up in access logs, so keep API Gateway access logging free of query
+strings, and keep token lifetimes short.

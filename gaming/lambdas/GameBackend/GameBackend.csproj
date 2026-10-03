@@ -12,6 +12,8 @@
     <PackageReference Include="Amazon.Lambda.Serialization.SystemTextJson" Version="2.*" />
     <PackageReference Include="Amazon.Lambda.APIGatewayEvents" Version="2.*" />
     <PackageReference Include="AWSSDK.DynamoDBv2" Version="3.*" />
+    <PackageReference Include="Microsoft.IdentityModel.JsonWebTokens" Version="8.*" />
+    <PackageReference Include="Microsoft.IdentityModel.Protocols.OpenIdConnect" Version="8.*" />
     <PackageReference Include="AWSSDK.ApiGatewayManagementApi" Version="3.*" />
     <PackageReference Include="AWSSDK.S3" Version="3.*" />
   </ItemGroup>

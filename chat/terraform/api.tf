@@ -17,9 +17,11 @@ resource "aws_apigatewayv2_integration" "chat" {
 }
 
 resource "aws_apigatewayv2_route" "connect" {
-  api_id    = aws_apigatewayv2_api.chat.id
-  route_key = "$connect"
-  target    = "integrations/${aws_apigatewayv2_integration.chat.id}"
+  api_id             = aws_apigatewayv2_api.chat.id
+  route_key          = "$connect"
+  target             = "integrations/${aws_apigatewayv2_integration.chat.id}"
+  authorization_type = "CUSTOM"
+  authorizer_id      = aws_apigatewayv2_authorizer.connect.id
 }
 
 resource "aws_apigatewayv2_route" "disconnect" {
@@ -40,6 +42,7 @@ resource "aws_apigatewayv2_deployment" "chat" {
   triggers = {
     redeployment = sha1(join(",", [
       aws_apigatewayv2_integration.chat.id,
+      aws_apigatewayv2_authorizer.connect.id,
       aws_apigatewayv2_route.connect.id,
       aws_apigatewayv2_route.disconnect.id,
       aws_apigatewayv2_route.default.id,

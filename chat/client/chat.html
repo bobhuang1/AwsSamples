@@ -21,6 +21,9 @@
     <input id="ws" placeholder="wss://YOUR-API.execute-api.us-east-1.amazonaws.com/v1" size="55">
   </div>
   <div class="row">
+    <input id="token" placeholder="Cognito ID token (see README)" size="55">
+  </div>
+  <div class="row">
     <input id="nick" placeholder="nickname" value="you">
     <input id="room" placeholder="roomId" value="general">
     <button id="connect">Connect</button>
@@ -31,14 +34,14 @@
   </div>
 
   <div id="log"></div>
-  <p class="meta">Open two tabs with different nicknames in the same room to watch the relay live.</p>
+  <p class="meta">Sign in as two different users (two ID tokens) in two tabs in the same room to watch the relay live.</p>
 
   <script>
     const log = (html) => { const d = document.createElement("div"); d.innerHTML = html; document.querySelector("#log").append(d); };
     let ws = null;
 
     document.querySelector("#connect").onclick = () => {
-      const url = `${document.querySelector("#ws").value.replace(/^wss?:\/\//, "wss://")}?nickname=${encodeURIComponent(document.querySelector("#nick").value)}&userId=${encodeURIComponent("u-" + Date.now())}&roomId=${encodeURIComponent(document.querySelector("#room").value)}`;
+      const url = `${document.querySelector("#ws").value.replace(/^wss?:\/\//, "wss://")}?token=${encodeURIComponent(document.querySelector("#token").value.trim())}&nickname=${encodeURIComponent(document.querySelector("#nick").value)}&roomId=${encodeURIComponent(document.querySelector("#room").value)}`;
       ws = new WebSocket(url);
       ws.onopen = () => log("<div class='meta'>connected</div>");
       ws.onclose = () => log("<div class='meta'>disconnected</div>");
