@@ -1,0 +1,42 @@
+{
+  "version": 1,
+  "dependencies": {
+    "net8.0": {
+      "Amazon.Lambda.APIGatewayEvents": {
+        "type": "Direct",
+        "requested": "[2.*, )",
+        "resolved": "2.7.3",
+        "contentHash": "CXmiXdwuSXSJA0YH+7OJqG2uGDnhDcKkN2ei2u2/kdRFK+RH8JC5GbdechdJoldpogxHdHy12TuAfqqKSC67Nw=="
+      },
+      "Amazon.Lambda.Core": {
+        "type": "Direct",
+        "requested": "[2.*, )",
+        "resolved": "2.8.1",
+        "contentHash": "wLrBdUXY1jn12o3+sar5c5ApMJPGEMye+1rnyDjwCKA2rcPNMZbNsKLQ76bV+DGnx5CN8bArB26SKB/rEuxIxQ=="
+      },
+      "Amazon.Lambda.Serialization.SystemTextJson": {
+        "type": "Direct",
+        "requested": "[2.*, )",
+        "resolved": "2.4.5",
+        "contentHash": "5A/uFtcGBbRP7yA2dAaG6H67Sb0HKvzy8tscHj8b4QiYsZ3fFykBdfqcYuLgIlTHJIutz6JzF8gOvlYH9/5s7g==",
+        "dependencies": {
+          "Amazon.Lambda.Core": "2.8.0"
+        }
+      },
+      "AWSSDK.DynamoDBv2": {
+        "type": "Direct",
+        "requested": "[3.*, )",
+        "resolved": "3.7.513.4",
+        "contentHash": "0um5M1tUa2xjY6Giu1OjWLekNvJc1+MEhfHPBsLf807lASnGIXgxiQevIlRgolstL2oQyJxb3a8RibAkAz/yoQ==",
+        "dependencies": {
+          "AWSSDK.Core": "[3.7.501.1, 4.0.0)"
+        }
+      },
+      "AWSSDK.Core": {
+        "type": "Transitive",
+        "resolved": "3.7.501.1",
+        "contentHash": "VZR0LRAawpn5FQwXNPzhOO8DHhfffhBSvcSZT1d0ctcZ+kmsz3tzTArZnTQ9Haf/TNEqNLzKupHfjV2ndWAL4A=="
+      }
+    }
+  }
+}

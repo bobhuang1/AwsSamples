@@ -1,0 +1,8 @@
+<Project>
+  <PropertyGroup>
+    <!-- Pin the resolved version of every package (including transitive ones) in packages.lock.json,
+         so builds are reproducible. CI restores in locked mode. After changing a PackageReference,
+         refresh the lock file with: dotnet restore (plus the force-evaluate switch). -->
+    <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
+  </PropertyGroup>
+</Project>
