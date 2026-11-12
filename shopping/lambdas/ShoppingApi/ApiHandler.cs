@@ -102,7 +102,8 @@ public sealed class ApiHandler
     {
         var caller = CallerId(request);
         if (caller is null) return Json(new { error = "Sign in required." }, HttpStatusCode.Unauthorized);
-        if (!string.Equals(Segment(path, 1), caller, StringComparison.Ordinal))
+        if (TrySegment(path, 1) is not { } owner) return NotFound("No route for " + path);
+        if (!string.Equals(owner, caller, StringComparison.Ordinal))
             return Json(new { error = "You can only access your own cart." }, HttpStatusCode.Forbidden);
         return await next();
     }
@@ -112,18 +113,30 @@ public sealed class ApiHandler
     private async Task<APIGatewayHttpApiV2ProxyResponse> ListProducts(APIGatewayHttpApiV2ProxyRequest request)
     {
         string? category = request.QueryStringParameters != null && request.QueryStringParameters.TryGetValue("category", out var c) ? c : null;
-        var items = new List<Dictionary<string, AttributeValue>>();
+        string? token = request.QueryStringParameters != null && request.QueryStringParameters.TryGetValue("nextToken", out var t) ? t : null;
 
-        if (string.IsNullOrEmpty(category))
+        // One page of at most ProductPageSize products, with or without a category. The next
+        // page is requested with ?nextToken=<value of the x-next-token response header>.
+        Dictionary<string, AttributeValue>? startKey = null;
+        if (!string.IsNullOrEmpty(token))
         {
-            // One explicit page: the first ProductPageSize products.
-            var scan = await _ddb.ScanAsync(new ScanRequest { TableName = _productsTable, Limit = ProductPageSize });
-            items.AddRange(scan.Items);
+            var lastId = DecodeToken(token);
+            if (lastId is null) return BadRequest("Invalid nextToken");
+            startKey = string.IsNullOrEmpty(category)
+                ? Key("product_id", lastId)
+                : new() { ["product_id"] = new() { S = lastId }, ["category"] = new() { S = category } };
         }
-        else
+
+        List<Dictionary<string, AttributeValue>> items;
+        Dictionary<string, AttributeValue>? lastKey;
+        try
         {
-            Dictionary<string, AttributeValue>? last = null;
-            do
+            if (string.IsNullOrEmpty(category))
+            {
+                var scan = await _ddb.ScanAsync(new ScanRequest { TableName = _productsTable, Limit = ProductPageSize, ExclusiveStartKey = startKey });
+                (items, lastKey) = (scan.Items, scan.LastEvaluatedKey);
+            }
+            else
             {
                 var q = await _ddb.QueryAsync(new QueryRequest
                 {
@@ -131,19 +144,42 @@ public sealed class ApiHandler
                     IndexName = "category-index",
                     KeyConditionExpression = "category = :c",
                     ExpressionAttributeValues = new Dictionary<string, AttributeValue> { [":c"] = new() { S = category } },
-                    ExclusiveStartKey = last,
+                    Limit = ProductPageSize,
+                    ExclusiveStartKey = startKey,
                 });
-                items.AddRange(q.Items);
-                last = q.LastEvaluatedKey is { Count: > 0 } ? q.LastEvaluatedKey : null;
-            } while (last is not null);
+                (items, lastKey) = (q.Items, q.LastEvaluatedKey);
+            }
+        }
+        catch (AmazonDynamoDBException ex) when (startKey is not null && ex.ErrorCode == "ValidationException")
+        {
+            return BadRequest("Invalid nextToken"); // a token that does not belong to this listing
         }
 
-        return Json(items.Select(ProductFromItem).ToList(), HttpStatusCode.OK, CatalogCacheSeconds);
+        var response = Json(items.Select(ProductFromItem).ToList(), HttpStatusCode.OK, CatalogCacheSeconds);
+        if (lastKey is { Count: > 0 } && lastKey.TryGetValue("product_id", out var lastProduct) && !string.IsNullOrEmpty(lastProduct.S))
+            response.Headers["x-next-token"] = EncodeToken(lastProduct.S);
+        return response;
+    }
+
+    private static string EncodeToken(string productId)
+        => Convert.ToBase64String(Encoding.UTF8.GetBytes(productId)).TrimEnd('=').Replace('+', '-').Replace('/', '_');
+
+    private static string? DecodeToken(string token)
+    {
+        try
+        {
+            var b64 = token.Replace('-', '+').Replace('_', '/');
+            b64 = b64.PadRight(b64.Length + (4 - b64.Length % 4) % 4, '=');
+            var id = Encoding.UTF8.GetString(Convert.FromBase64String(b64));
+            return id.Length is > 0 and <= 128 ? id : null;
+        }
+        catch (FormatException) { return null; }
     }
 
     private async Task<APIGatewayHttpApiV2ProxyResponse> GetProduct(string path)
     {
         var id = Uri.UnescapeDataString(path[(path.LastIndexOf('/') + 1)..]);
+        if (id.Length == 0) return NotFound("No product");
         var res = await _ddb.GetItemAsync(new GetItemRequest { TableName = _productsTable, Key = Key("product_id", id) });
         return res.Item is not { Count: > 0 } item
             ? NotFound("No product " + id)
@@ -264,7 +300,7 @@ public sealed class ApiHandler
     private async Task<APIGatewayHttpApiV2ProxyResponse> RemoveFromCart(string path)
     {
         var userId = Segment(path, 1);
-        var productId = Segment(path, 3);
+        if (TrySegment(path, 3) is not { Length: > 0 } productId) return NotFound("Use DELETE /cart/{userId}/items/{productId}");
 
         var now = DateTimeOffset.UtcNow;
         try
@@ -322,6 +358,20 @@ public sealed class ApiHandler
         if (items.Count == 0) return BadRequest("Cart is empty");
         if (items.Count > MaxLinesAtCheckout)
             return BadRequest($"A cart can hold at most {MaxLinesAtCheckout} different products at checkout");
+
+        // A cart line keeps the price from when it was added (up to 7 days ago). Compare with
+        // the catalog now and stop if anything changed: the shopper must never pay a price
+        // they have not seen. Adding the product again refreshes its line.
+        var stale = await StaleLines(items);
+        if (stale.Count > 0)
+        {
+            return Json(new
+            {
+                error = "Some prices changed or products are no longer sold. Add those items to the cart again to refresh them. Nothing was ordered.",
+                changed = stale,
+            }, HttpStatusCode.Conflict);
+        }
+
         var total = items.Sum(i => i.Price * i.Quantity);
         var now = DateTimeOffset.UtcNow;
 
@@ -408,6 +458,38 @@ public sealed class ApiHandler
         return Json(new { orderId, total, status = "PLACED" }, HttpStatusCode.Created);
     }
 
+    /// <summary>Cart lines whose catalog price is not the line price any more, or whose product is gone.</summary>
+    private async Task<List<object>> StaleLines(List<CartItem> items)
+    {
+        var current = new Dictionary<string, string>(StringComparer.Ordinal); // product id -> price as "0.00"
+        var pending = items.Select(i => Key("product_id", i.ProductId)).ToList();
+        for (var attempt = 0; pending.Count > 0; attempt++)
+        {
+            if (attempt == 3) throw new InvalidOperationException("The catalog could not be read; retry the checkout.");
+            var res = await _ddb.BatchGetItemAsync(new BatchGetItemRequest
+            {
+                RequestItems = new Dictionary<string, KeysAndAttributes>
+                {
+                    [_productsTable] = new() { Keys = pending, ProjectionExpression = "product_id, price", ConsistentRead = true },
+                },
+            });
+            foreach (var p in res.Responses.GetValueOrDefault(_productsTable) ?? [])
+                current[Str(p, "product_id")] = Dec(p, "price").ToString("0.00", CultureInfo.InvariantCulture);
+            pending = res.UnprocessedKeys is { Count: > 0 } left && left.TryGetValue(_productsTable, out var again) ? again.Keys : [];
+        }
+
+        return items
+            .Where(i => !current.TryGetValue(i.ProductId, out var now) || now != i.Price.ToString("0.00", CultureInfo.InvariantCulture))
+            .Select(i => (object)new
+            {
+                productId = i.ProductId,
+                name = i.Name,
+                cartPrice = i.Price.ToString("0.00", CultureInfo.InvariantCulture),
+                catalogPrice = current.GetValueOrDefault(i.ProductId),
+            })
+            .ToList();
+    }
+
     private async Task<Dictionary<string, AttributeValue>?> FindOrder(string orderId)
     {
         var res = await _ddb.GetItemAsync(new GetItemRequest { TableName = _ordersTable, Key = Key("order_id", orderId), ConsistentRead = true });
@@ -418,12 +500,19 @@ public sealed class ApiHandler
         => Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes($"{userId}\n{idempotencyKey}")))[..32].ToLowerInvariant();
 
     private static APIGatewayHttpApiV2ProxyResponse PlacedOrder(Dictionary<string, AttributeValue> placed)
-        => Json(new { orderId = Str(placed, "order_id"), total = Str(placed, "total"), status = Str(placed, "status") }, HttpStatusCode.OK);
+        => Json(new { orderId = Str(placed, "order_id"), total = Dec(placed, "total"), status = Str(placed, "status") }, HttpStatusCode.OK);
 
     // ---------------- helpers ----------------
 
     private static string Segment(string path, int index)
-        => Uri.UnescapeDataString(path.Split('/', StringSplitOptions.RemoveEmptyEntries)[index]);
+        => TrySegment(path, index) ?? throw new IndexOutOfRangeException();
+
+    /// <summary>The path segment at the index, or null when the path is shorter.</summary>
+    private static string? TrySegment(string path, int index)
+    {
+        var parts = path.Split('/', StringSplitOptions.RemoveEmptyEntries);
+        return index < parts.Length ? Uri.UnescapeDataString(parts[index]) : null;
+    }
 
     private static string Env(string name, string fallback) => Environment.GetEnvironmentVariable(name) ?? fallback;
 

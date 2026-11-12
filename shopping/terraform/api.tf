@@ -51,7 +51,9 @@ resource "aws_apigatewayv2_api" "shop" {
     allow_origins = ["*"]
     allow_methods = ["GET", "POST", "DELETE"]
     allow_headers = ["content-type", "authorization", "idempotency-key"]
-    max_age       = 300
+    # Lets a browser read the page token of GET /products.
+    expose_headers = ["x-next-token"]
+    max_age        = 300
   }
 }
 

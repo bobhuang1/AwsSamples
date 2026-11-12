@@ -100,7 +100,11 @@ resource "aws_cloudfront_distribution" "frontend" {
     }
   }
 
+  # The default *.cloudfront.net certificate, or your own ACM certificate when a custom domain is set.
   viewer_certificate {
-    cloudfront_default_certificate = true
+    cloudfront_default_certificate = var.domain_name == null
+    acm_certificate_arn            = var.domain_name == null ? null : var.acm_certificate_arn
+    ssl_support_method             = var.domain_name == null ? null : "sni-only"
+    minimum_protocol_version       = var.domain_name == null ? null : "TLSv1.2_2021"
   }
 }

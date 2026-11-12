@@ -64,6 +64,13 @@ aws dynamodb batch-write-item `
 curl "$(terraform output -raw api_endpoint)/products"
 ```
 
+`GET /products` returns one page of up to 50 products (also with `?category=`). When
+more exist, the response carries an `x-next-token` header; send it back as `?nextToken=` for the next page.
+
+To use your own domain, set both `domain_name` and `acm_certificate_arn` (an issued ACM certificate in
+`us-east-1` that covers the domain) and point a DNS record at the distribution. Setting `domain_name`
+alone fails validation.
+
 ## The "large scale" bits
 
 - **Catch-all route + path dispatch.** One `$default` route, one integration,
@@ -88,7 +95,10 @@ curl "$(terraform output -raw api_endpoint)/products"
   `outOfStock` list; nothing is ordered and no stock is taken. A transaction
   holds 100 items, so a cart can have at most 98 different products at
   checkout (`400` otherwise). Stock is not given back if an order is later
-  abandoned; add a cancel step for that.
+  abandoned; add a cancel step for that. A cart line keeps the price from when
+  it was added, so checkout first compares each line with the catalog and
+  answers `409` with a `changed` list if a price moved or a product is gone;
+  adding that product again refreshes its line.
 - **Async checkout with an outbox.** The same transaction is all the API
   does. The order row is the only copy of the order (there is no duplicate
   `payload` attribute). The orders

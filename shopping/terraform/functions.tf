@@ -9,7 +9,7 @@ locals {
   # Only the calls each function makes (checked against the handler code).
   lambda_statements = {
     api = [
-      { Effect = "Allow", Action = ["dynamodb:GetItem", "dynamodb:Scan"], Resource = aws_dynamodb_table.products.arn },
+      { Effect = "Allow", Action = ["dynamodb:GetItem", "dynamodb:BatchGetItem", "dynamodb:Scan"], Resource = aws_dynamodb_table.products.arn },
       { Effect = "Allow", Action = "dynamodb:Query", Resource = "${aws_dynamodb_table.products.arn}/index/category-index" },
       # Checkout takes stock with a conditional update, so the API may update the stock
       # attribute of a product (and nothing else on the catalog).
@@ -30,6 +30,8 @@ locals {
       { Effect = "Allow", Action = "dynamodb:ListStreams", Resource = "*" },
       { Effect = "Allow", Action = "sqs:SendMessage", Resource = aws_sqs_queue.orders.arn },
       { Effect = "Allow", Action = "events:PutEvents", Resource = aws_cloudwatch_event_bus.orders.arn },
+      # Where the stream mapping parks the metadata of a batch that kept failing.
+      { Effect = "Allow", Action = "sqs:SendMessage", Resource = aws_sqs_queue.orders_outbox_failures.arn },
     ]
     orders-worker = [
       { Effect = "Allow", Action = "dynamodb:UpdateItem", Resource = aws_dynamodb_table.orders.arn },
@@ -135,6 +137,18 @@ resource "aws_lambda_event_source_mapping" "orders_outbox" {
   starting_position       = "TRIM_HORIZON"
   batch_size              = 10
   function_response_types = ["ReportBatchItemFailures"]
+
+  # A record that keeps failing must not hold up the orders behind it until the stream's
+  # 24 h retention drops it: retry a few times, split the batch to isolate it, then park it.
+  maximum_retry_attempts         = 5
+  maximum_record_age_in_seconds  = 3600
+  bisect_batch_on_function_error = true
+
+  destination_config {
+    on_failure {
+      destination_arn = aws_sqs_queue.orders_outbox_failures.arn
+    }
+  }
 
   filter_criteria {
     filter {

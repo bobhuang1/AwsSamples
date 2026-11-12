@@ -20,6 +20,13 @@ resource "aws_sqs_queue" "orders_dlq" {
   message_retention_seconds = 1209600
 }
 
+# Metadata of order-stream batches that kept failing (not the orders themselves).
+resource "aws_sqs_queue" "orders_outbox_failures" {
+  sqs_managed_sse_enabled   = true
+  name                      = "${local.unique}-orders-outbox-failures"
+  message_retention_seconds = 1209600
+}
+
 # Process orders from the queue in batches; report batch-item failures so the
 # good messages move on while bad ones redrive to the DLQ.
 resource "aws_lambda_event_source_mapping" "orders" {

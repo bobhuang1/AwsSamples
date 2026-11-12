@@ -16,9 +16,25 @@ public class ApiHandlerTests
     private readonly IAmazonDynamoDB _ddb = Substitute.For<IAmazonDynamoDB>();
     private readonly ApiHandler _handler;
 
+    // Catalog prices seen by the checkout price check (product id -> price); anything not listed costs 10.00.
+    private readonly Dictionary<string, string> _catalogPrices = [];
+
     public ApiHandlerTests()
     {
         _handler = new ApiHandler(_ddb);
+        _ddb.BatchGetItemAsync(Arg.Any<BatchGetItemRequest>(), Arg.Any<CancellationToken>()).Returns(call =>
+        {
+            var keys = call.Arg<BatchGetItemRequest>().RequestItems["products"].Keys;
+            return Task.FromResult(new BatchGetItemResponse
+            {
+                Responses = new() { ["products"] = keys.Select(k => new Dictionary<string, AttributeValue>
+                {
+                    ["product_id"] = k["product_id"],
+                    ["price"] = S(_catalogPrices.GetValueOrDefault(k["product_id"].S, "10.00")),
+                }).ToList() },
+                UnprocessedKeys = [],
+            });
+        });
     }
 
     // ---------------- helpers ----------------
@@ -284,6 +300,7 @@ public class ApiHandlerTests
     public async Task Checkout_places_the_order_deletes_the_cart_and_takes_the_stock_in_one_transaction()
     {
         GivenCart(7, 100, Line("a", 2, "10.00"), Line("b", 1, "4.50"));
+        _catalogPrices["b"] = "4.50";
         TransactWriteItemsRequest? sent = null;
         _ddb.TransactWriteItemsAsync(Arg.Do<TransactWriteItemsRequest>(r => sent = r), Arg.Any<CancellationToken>())
             .Returns(new TransactWriteItemsResponse());
@@ -317,6 +334,42 @@ public class ApiHandlerTests
             Assert.Equal("SET stock = stock - :q", u.UpdateExpression);
         });
         Assert.Equal("2", stock.Single(u => u.Key["product_id"].S == "a").ExpressionAttributeValues[":q"].N);
+    }
+
+    [Fact]
+    public async Task Checkout_stops_when_a_catalog_price_changed_since_the_line_was_added()
+    {
+        GivenCart(7, 100, Line("a", 2, "10.00"), Line("b", 1, "4.50"));
+        _catalogPrices["b"] = "5.25"; // "a" is still 10.00
+
+        var res = await _handler.Handle(Http("POST", "/orders"), Context());
+
+        Assert.Equal(409, res.StatusCode);
+        var changed = Json(res.Body).GetProperty("changed");
+        Assert.Equal(1, changed.GetArrayLength());
+        Assert.Equal("b", changed[0].GetProperty("productId").GetString());
+        Assert.Equal("4.50", changed[0].GetProperty("cartPrice").GetString());
+        Assert.Equal("5.25", changed[0].GetProperty("catalogPrice").GetString());
+        await _ddb.DidNotReceiveWithAnyArgs().TransactWriteItemsAsync(default!, default);
+    }
+
+    [Fact]
+    public async Task A_replayed_checkout_returns_the_total_as_a_number_like_the_first_response()
+    {
+        GivenCart(7, 100, Line("a", 2, "10.00"), Line("b", 1, "4.50"));
+        _catalogPrices["b"] = "4.50";
+        _ddb.TransactWriteItemsAsync(Arg.Any<TransactWriteItemsRequest>(), Arg.Any<CancellationToken>()).Returns(new TransactWriteItemsResponse());
+        _ddb.GetItemAsync(Arg.Is<GetItemRequest>(r => r.TableName == "orders"), Arg.Any<CancellationToken>()).Returns(new GetItemResponse()); // no order yet
+        var headers = new Dictionary<string, string> { ["idempotency-key"] = "k-1" };
+        var first = await _handler.Handle(Http("POST", "/orders", headers: headers), Context());
+
+        _ddb.GetItemAsync(Arg.Is<GetItemRequest>(r => r.TableName == "orders"), Arg.Any<CancellationToken>())
+            .Returns(new GetItemResponse { Item = new() { ["order_id"] = S("o-1"), ["total"] = S("24.50"), ["status"] = S("PLACED") } });
+        var replay = await _handler.Handle(Http("POST", "/orders", headers: headers), Context());
+
+        Assert.Equal(JsonValueKind.Number, Json(first.Body).GetProperty("total").ValueKind);
+        Assert.Equal(JsonValueKind.Number, Json(replay.Body).GetProperty("total").ValueKind);
+        Assert.Equal(24.50m, Json(replay.Body).GetProperty("total").GetDecimal());
     }
 
     [Fact]
@@ -417,6 +470,64 @@ public class ApiHandlerTests
         var p = Json(res.Body)[0];
         Assert.Equal(5m, p.GetProperty("price").GetDecimal());
         Assert.Equal(3, p.GetProperty("stock").GetInt32());
+    }
+
+    [Theory]
+    [InlineData("GET", "/cart/")]
+    [InlineData("GET", "/cart")]
+    [InlineData("DELETE", "/cart/user-1/items")]
+    [InlineData("DELETE", "/cart/user-1/items/")]
+    [InlineData("GET", "/products/")]
+    public async Task Malformed_paths_are_a_404_not_a_500(string method, string path)
+    {
+        var res = await _handler.Handle(Http(method, path), Context());
+
+        Assert.Equal(404, res.StatusCode);
+        await _ddb.DidNotReceiveWithAnyArgs().GetItemAsync(default(GetItemRequest)!, default);
+        await _ddb.DidNotReceiveWithAnyArgs().UpdateItemAsync(default!, default);
+    }
+
+    [Fact]
+    public async Task The_catalog_is_paged_with_a_token_in_a_response_header()
+    {
+        ScanRequest? scan = null;
+        _ddb.ScanAsync(Arg.Do<ScanRequest>(r => scan = r), Arg.Any<CancellationToken>()).Returns(new ScanResponse
+        {
+            Items = [new() { ["product_id"] = S("a"), ["name"] = S("A"), ["price"] = N(5), ["stock"] = N(3) }],
+            LastEvaluatedKey = new() { ["product_id"] = S("a") },
+        });
+
+        var first = await _handler.Handle(Http("GET", "/products", sub: null), Context());
+        var token = first.Headers["x-next-token"];
+        Assert.Null(scan!.ExclusiveStartKey); // no token: starts at the top
+
+        var next = Http("GET", "/products", sub: null);
+        next.QueryStringParameters = new Dictionary<string, string> { ["nextToken"] = token };
+        await _handler.Handle(next, Context());
+
+        Assert.Equal("a", scan.ExclusiveStartKey["product_id"].S);
+        Assert.Equal(50, scan.Limit);
+    }
+
+    [Fact]
+    public async Task A_category_listing_is_one_bounded_page_and_a_garbage_token_is_a_400()
+    {
+        QueryRequest? query = null;
+        _ddb.QueryAsync(Arg.Do<QueryRequest>(r => query = r), Arg.Any<CancellationToken>()).Returns(new QueryResponse
+        {
+            Items = [new() { ["product_id"] = S("a"), ["category"] = S("books"), ["name"] = S("A"), ["price"] = N(5), ["stock"] = N(3) }],
+            LastEvaluatedKey = new() { ["product_id"] = S("a"), ["category"] = S("books") },
+        });
+        var request = Http("GET", "/products", sub: null);
+        request.QueryStringParameters = new Dictionary<string, string> { ["category"] = "books" };
+
+        var res = await _handler.Handle(request, Context());
+
+        Assert.Equal(50, query!.Limit);
+        Assert.True(res.Headers.ContainsKey("x-next-token"));
+
+        request.QueryStringParameters["nextToken"] = "!!!not-base64!!!";
+        Assert.Equal(400, (await _handler.Handle(request, Context())).StatusCode);
     }
 
     [Fact]
