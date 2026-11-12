@@ -35,6 +35,9 @@ public sealed class MessageHandler
     private readonly string _messagesTable    = Shared.Env("MESSAGES_TABLE");
     private readonly string _fanoutQueueUrl   = Shared.Env("FANOUT_QUEUE_URL");
 
+    private const int MaxTextLength = 2000;
+    private static readonly TimeSpan PresenceLease = TimeSpan.FromHours(6);
+
     private static readonly Lazy<AmazonSQSClient> Sqs = new(() => new AmazonSQSClient());
 
     public async Task<APIGatewayProxyResponse> Handle(APIGatewayProxyRequest request, ILambdaContext context)
@@ -84,7 +87,7 @@ public sealed class MessageHandler
             ["nickname"]      = nickname,
             ["room_id"]       = roomId,
             ["connected_at"]  = now.ToUnixTimeSeconds().ToString(),
-            ["ttl"]           = now.AddHours(6).ToUnixTimeSeconds(), // DynamoDB TTL only honours a Number attribute
+            ["ttl"]           = now.Add(PresenceLease).ToUnixTimeSeconds(), // DynamoDB TTL only honours a Number attribute
         });
         return Shared.Ok(JsonSerializer.Serialize(new { status = "connected", room_id = roomId }));
     }
@@ -106,6 +109,7 @@ public sealed class MessageHandler
 
         var text = root.TryGetProperty("text", out var t) ? t.GetString() : "";
         if (string.IsNullOrWhiteSpace(text)) return Shared.Ok(JsonSerializer.Serialize(new { error = "empty text" }));
+        if (text.Length > MaxTextLength) return Shared.Ok(JsonSerializer.Serialize(new { error = $"text too long (max {MaxTextLength})" }));
 
         var connections = Table.LoadTable(Shared.Ddb.Value, _connectionsTable);
         var conn = await connections.GetItemAsync(connectionId);
@@ -143,21 +147,26 @@ public sealed class MessageHandler
             MessageBody = JsonSerializer.Serialize(message, Shared.JsonOpts),
         });
 
-        // Refresh the presence TTL.
-        await Shared.Ddb.Value.UpdateItemAsync(new Amazon.DynamoDBv2.Model.UpdateItemRequest
+        // Refresh the presence TTL, but only once half the lease is gone: a write
+        // on the connections table for every chat line is not needed.
+        var currentTtl = conn.TryGetValue("ttl", out var ttlEntry) ? ttlEntry.AsLong() : 0;
+        if (currentTtl - now.ToUnixTimeSeconds() < PresenceLease.TotalSeconds / 2)
         {
-            TableName = _connectionsTable,
-            Key = new Dictionary<string, Amazon.DynamoDBv2.Model.AttributeValue>
+            await Shared.Ddb.Value.UpdateItemAsync(new Amazon.DynamoDBv2.Model.UpdateItemRequest
             {
-                ["connection_id"] = new() { S = connectionId },
-            },
-            UpdateExpression = "SET #t = :t",
-            ExpressionAttributeNames = new Dictionary<string, string> { ["#t"] = "ttl" },
-            ExpressionAttributeValues = new Dictionary<string, Amazon.DynamoDBv2.Model.AttributeValue>
-            {
-                [":t"] = new() { N = now.AddHours(6).ToUnixTimeSeconds().ToString() },
-            },
-        });
+                TableName = _connectionsTable,
+                Key = new Dictionary<string, Amazon.DynamoDBv2.Model.AttributeValue>
+                {
+                    ["connection_id"] = new() { S = connectionId },
+                },
+                UpdateExpression = "SET #t = :t",
+                ExpressionAttributeNames = new Dictionary<string, string> { ["#t"] = "ttl" },
+                ExpressionAttributeValues = new Dictionary<string, Amazon.DynamoDBv2.Model.AttributeValue>
+                {
+                    [":t"] = new() { N = now.Add(PresenceLease).ToUnixTimeSeconds().ToString() },
+                },
+            });
+        }
 
         return Shared.Ok(JsonSerializer.Serialize(new { delivered = false, message_id = message.MessageId }));
     }

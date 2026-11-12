@@ -48,8 +48,8 @@ $client = (terraform output -raw cognito_client_id)
 
 aws cognito-idp admin-create-user --user-pool-id $pool --username alice --temporary-password 'TempPass1!' --message-action SUPPRESS
 aws cognito-idp admin-set-user-password --user-pool-id $pool --username alice --password 'YourPass1!' --permanent
-$token = (aws cognito-idp initiate-auth --client-id $client --auth-flow alice_PASSWORD_AUTH `
-  --auth-parameters aliceNAME=alice,PASSWORD='YourPass1!' --query AuthenticationResult.IdToken --output text)
+$token = (aws cognito-idp initiate-auth --client-id $client --auth-flow USER_PASSWORD_AUTH `
+  --auth-parameters USERNAME=alice,PASSWORD='YourPass1!' --query AuthenticationResult.IdToken --output text)
 ```
 
 Open `client/chat.html`, paste the endpoint and the ID token, pick a nickname

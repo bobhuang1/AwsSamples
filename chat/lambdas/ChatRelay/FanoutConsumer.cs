@@ -6,6 +6,7 @@ using Amazon.DynamoDBv2;
 using Amazon.DynamoDBv2.DocumentModel;
 using Amazon.DynamoDBv2.Model;
 using Amazon.Lambda.Core;
+using Amazon.Runtime;
 using Amazon.Lambda.SQSEvents;
 
 namespace ChatRelay;
@@ -13,15 +14,25 @@ namespace ChatRelay;
 /// <summary>
 /// SQS consumer that delivers a message to every live socket in its room.
 /// Delivery failures prune dead connections (a GoneException means the socket
-/// no longer exists); anything else is reported as a batch-item failure and
-/// redrives to the DLQ after 5 attempts.
+/// no longer exists); a failure to read the room is reported as a batch-item
+/// failure and redrives to the DLQ after 5 attempts. Delivery is at-least-once,
+/// so clients de-duplicate on message_id.
 /// </summary>
 public sealed class FanoutConsumer
 {
     private readonly string _connectionsTable = Shared.Env("CONNECTIONS_TABLE");
     private readonly string _wsEndpoint       = Shared.Env("WS_ENDPOINT");
 
+    // Sockets written to at the same time per message; keeps a big room from
+    // taking one round trip after another without flooding the Management API.
+    private const int MaxParallelPosts = 32;
+
     private static readonly Lazy<AmazonDynamoDBClient> Ddb = new(() => new AmazonDynamoDBClient());
+
+    // One client for the life of the container, so the TLS connection is reused.
+    private static AmazonApiGatewayManagementApiClient? _api;
+    private AmazonApiGatewayManagementApiClient Api =>
+        _api ??= new AmazonApiGatewayManagementApiClient(new AmazonApiGatewayManagementApiConfig { ServiceURL = _wsEndpoint });
 
     public async Task<SQSBatchResponse> Handle(SQSEvent input, ILambdaContext context)
     {
@@ -47,9 +58,9 @@ public sealed class FanoutConsumer
 
     private async Task Deliver(JsonElement message, string roomId, ILambdaContext context)
     {
-        // All sockets in the room (GSI, KEYS_ONLY projection).
+        // All sockets in the room (GSI, KEYS_ONLY projection, so pages are small).
         var peersIds = new List<string>();
-        string? lastKey = null;
+        Dictionary<string, AttributeValue>? lastKey = null;
         do
         {
             var q = await Ddb.Value.QueryAsync(new QueryRequest
@@ -59,15 +70,10 @@ public sealed class FanoutConsumer
                 KeyConditionExpression = "room_id = :r",
                 ExpressionAttributeValues = new Dictionary<string, AttributeValue> { [":r"] = new() { S = roomId } },
                 ProjectionExpression = "connection_id",
-                Limit = 50,
-                ExclusiveStartKey = lastKey is null ? null : new Dictionary<string, AttributeValue>
-                {
-                    ["connection_id"] = new() { S = lastKey },
-                    ["room_id"] = new() { S = roomId },
-                },
+                ExclusiveStartKey = lastKey,
             });
             peersIds.AddRange(q.Items.Select(i => i["connection_id"].S));
-            lastKey = q.LastEvaluatedKey.ContainsKey("connection_id") ? q.LastEvaluatedKey["connection_id"].S : null;
+            lastKey = q.LastEvaluatedKey is { Count: > 0 } ? q.LastEvaluatedKey : null;
         } while (lastKey is not null);
 
         if (peersIds.Count == 0) return;
@@ -85,24 +91,31 @@ public sealed class FanoutConsumer
             },
         });
 
-        using var api = new AmazonApiGatewayManagementApiClient(new AmazonApiGatewayManagementApiConfig { ServiceURL = _wsEndpoint });
-        var roomeTable = Table.LoadTable(Ddb.Value, _connectionsTable);
+        var connections = Table.LoadTable(Ddb.Value, _connectionsTable);
+        var data = System.Text.Encoding.UTF8.GetBytes(payload);
 
-        foreach (var connectionId in peersIds)
+        // A failure for one socket must not fail the whole message: SQS would
+        // redeliver it and every socket already served would see it again.
+        // Gone sockets are pruned; other per-socket errors are logged and skipped.
+        await Parallel.ForEachAsync(peersIds, new ParallelOptions { MaxDegreeOfParallelism = MaxParallelPosts }, async (connectionId, ct) =>
         {
             try
             {
-                await api.PostToConnectionAsync(new PostToConnectionRequest
+                await Api.PostToConnectionAsync(new PostToConnectionRequest
                 {
                     ConnectionId = connectionId,
-                    Data = new MemoryStream(System.Text.Encoding.UTF8.GetBytes(payload)),
-                });
+                    Data = new MemoryStream(data),
+                }, ct);
             }
             catch (GoneException gex)
             {
                 context.Logger.LogInformation("Pruning stale connection {0} ({1})", connectionId, gex.Message);
-                await roomeTable.DeleteItemAsync(connectionId);
+                await connections.DeleteItemAsync(connectionId, ct);
             }
-        }
+            catch (Exception ex) when (ex is AmazonServiceException)
+            {
+                context.Logger.LogWarning("Delivery to {0} failed: {1}", connectionId, ex.Message);
+            }
+        });
     }
 }

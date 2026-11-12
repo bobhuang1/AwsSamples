@@ -39,6 +39,7 @@
   <script>
     const log = (html) => { const d = document.createElement("div"); d.innerHTML = html; document.querySelector("#log").append(d); };
     let ws = null;
+    const seen = new Set(); // delivery is at-least-once: drop repeats by message_id
 
     document.querySelector("#connect").onclick = () => {
       const url = `${document.querySelector("#ws").value.replace(/^wss?:\/\//, "wss://")}?token=${encodeURIComponent(document.querySelector("#token").value.trim())}&nickname=${encodeURIComponent(document.querySelector("#nick").value)}&roomId=${encodeURIComponent(document.querySelector("#room").value)}`;
@@ -49,6 +50,8 @@
         const data = JSON.parse(e.data);
         if (data.type === "message") {
           const m = data.message;
+          if (seen.has(m.message_id)) return;
+          seen.add(m.message_id);
           log(`<div><span class="meta">${new Date(m.created_at).toLocaleTimeString()}</span> <b>${esc(m.nickname)}</b>: ${esc(m.text)}</div>`);
         }
       };

@@ -1,7 +1,7 @@
 # Fan-out: buffered via SQS so delivery backlogs never slow the writer.
 resource "aws_sqs_queue" "fanout" {
   name                       = "${local.unique}-fanout"
-  visibility_timeout_seconds = 30
+  visibility_timeout_seconds = 360 # at least 6x the 60 s fanout timeout (AWS guidance)
   message_retention_seconds  = 86400
   redrive_policy = jsonencode({
     deadLetterTargetArn = aws_sqs_queue.fanout_dlq.arn
@@ -25,8 +25,12 @@ resource "aws_lambda_event_source_mapping" "fanout" {
 
 # ---------- Lambda roles ----------
 
-resource "aws_cloudwatch_log_group" "chat" {
-  name              = "/aws/lambda/${local.unique}-chat"
+# One log group per function, named exactly /aws/lambda/<function name>:
+# that is the only group Lambda writes to, so a differently named group
+# would never receive logs.
+resource "aws_cloudwatch_log_group" "lambda" {
+  for_each          = toset(["message", "fanout", "authorizer"])
+  name              = "/aws/lambda/${local.unique}-${each.key}"
   retention_in_days = 14
 }
 
@@ -52,10 +56,12 @@ resource "aws_iam_role_policy" "message" {
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [
-      { Effect = "Allow", Action = "logs:CreateLogStream", Resource = aws_cloudwatch_log_group.chat.arn },
-      { Effect = "Allow", Action = ["logs:PutLogEvents"], Resource = "${aws_cloudwatch_log_group.chat.arn}:*" },
+      { Effect = "Allow", Action = "logs:CreateLogStream", Resource = aws_cloudwatch_log_group.lambda["message"].arn },
+      { Effect = "Allow", Action = ["logs:PutLogEvents"], Resource = "${aws_cloudwatch_log_group.lambda["message"].arn}:*" },
+      # connections: $connect put, $disconnect delete, message get + presence update
       { Effect = "Allow", Action = ["dynamodb:PutItem", "dynamodb:GetItem", "dynamodb:UpdateItem", "dynamodb:DeleteItem"],
-      Resource = [aws_dynamodb_table.connections.arn, aws_dynamodb_table.messages.arn, "${aws_dynamodb_table.connections.arn}/index/*", "${aws_dynamodb_table.messages.arn}/index/*"] },
+      Resource = aws_dynamodb_table.connections.arn },
+      { Effect = "Allow", Action = "dynamodb:PutItem", Resource = aws_dynamodb_table.messages.arn },
       { Effect = "Allow", Action = "sqs:SendMessage", Resource = aws_sqs_queue.fanout.arn },
     ]
   })
@@ -73,14 +79,16 @@ resource "aws_iam_role_policy" "fanout" {
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [
-      { Effect = "Allow", Action = "logs:CreateLogStream", Resource = aws_cloudwatch_log_group.chat.arn },
-      { Effect = "Allow", Action = ["logs:PutLogEvents"], Resource = "${aws_cloudwatch_log_group.chat.arn}:*" },
+      { Effect = "Allow", Action = "logs:CreateLogStream", Resource = aws_cloudwatch_log_group.lambda["fanout"].arn },
+      { Effect = "Allow", Action = ["logs:PutLogEvents"], Resource = "${aws_cloudwatch_log_group.lambda["fanout"].arn}:*" },
       { Effect = "Allow", Action = ["sqs:ReceiveMessage", "sqs:DeleteMessage", "sqs:GetQueueAttributes"],
       Resource = aws_sqs_queue.fanout.arn },
-      { Effect = "Allow", Action = ["dynamodb:Query", "dynamodb:DeleteItem", "dynamodb:GetItem"],
-      Resource = [aws_dynamodb_table.connections.arn, aws_dynamodb_table.messages.arn, "${aws_dynamodb_table.connections.arn}/index/*", "${aws_dynamodb_table.messages.arn}/index/*"] },
+      { Effect = "Allow", Action = "dynamodb:Query", Resource = "${aws_dynamodb_table.connections.arn}/index/room-index" },
+      { Effect = "Allow", Action = "dynamodb:DeleteItem", Resource = aws_dynamodb_table.connections.arn },
+      # PostToConnection is authorized against <api>/<stage>/POST/@connections/<id>,
+      # not against the bare stage ARN.
       { Effect = "Allow", Action = "execute-api:ManageConnections",
-      Resource = aws_apigatewayv2_stage.chat.execution_arn },
+      Resource = "${aws_apigatewayv2_stage.chat.execution_arn}/POST/@connections/*" },
     ]
   })
 }
@@ -96,6 +104,7 @@ resource "aws_lambda_function" "message" {
   source_code_hash = filebase64sha256("${path.module}/dist/ChatRelay.zip")
   timeout          = 30
   memory_size      = 512
+  depends_on       = [aws_cloudwatch_log_group.lambda]
 
   environment {
     variables = {
@@ -115,6 +124,7 @@ resource "aws_lambda_function" "fanout" {
   source_code_hash = filebase64sha256("${path.module}/dist/ChatRelay.zip")
   timeout          = 60
   memory_size      = 512
+  depends_on       = [aws_cloudwatch_log_group.lambda]
 
   environment {
     variables = {

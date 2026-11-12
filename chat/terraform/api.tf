@@ -6,6 +6,10 @@
 resource "aws_apigatewayv2_api" "chat" {
   name          = "${local.unique}-ws"
   protocol_type = "WEBSOCKET"
+
+  # Clients send {"action":"send","text":"..."}; the handler checks the action
+  # itself, so every frame goes to $default either way.
+  route_selection_expression = "$request.body.action"
 }
 
 resource "aws_apigatewayv2_integration" "chat" {
@@ -59,6 +63,12 @@ resource "aws_apigatewayv2_stage" "chat" {
   api_id        = aws_apigatewayv2_api.chat.id
   name          = local.api_stage
   deployment_id = aws_apigatewayv2_deployment.chat.id
+
+  # Cap the request rate so a client loop cannot drive Lambda/DynamoDB cost.
+  default_route_settings {
+    throttling_rate_limit  = 50
+    throttling_burst_limit = 100
+  }
 }
 
 resource "aws_lambda_permission" "message" {
