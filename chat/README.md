@@ -26,7 +26,7 @@ WebSocket API ($connect / $default / $disconnect)
 | --- | --- | --- |
 | Transport | API Gateway WebSocket API | Three routes; the browser client is a plain HTML file |
 | Write path | `MessageHandler` Lambda | Put message + enqueue. Returns before delivery is finished |
-| Storage | DynamoDB | `messages` with `room-messages-index` feed; `connections` with `room-index` and a 6h/1h TTL |
+| Storage | DynamoDB | `messages` with a keys-only `room-messages-index` (write-only until a history route exists); `connections` with `room-index`, `user-index` (max 5 sockets per user) and a 6h/1h TTL |
 | Buffer | SQS + DLQ | Fan-out storms backlog in the queue instead of throttling the writer |
 | Delivery | `FanoutConsumer` Lambda | Batch read, room sockets via GSI, `postToConnection` per socket, prunes gone sockets, redrives on failure |
 
@@ -72,7 +72,9 @@ same room — messages relay live between them.
 
 ## Grow it further
 
-- Modes: support `{"action":"history","roomId":...}` to replay `room-messages-index`;
+- Modes: support `{"action":"history","roomId":...}` to replay `room-messages-index`
+  (the index holds keys only: read the rows with `BatchGetItem`, or switch the index to
+  `ALL` projection together with that route);
   unread counts as a per-user counter table.
 - Delivery semantics: batch fan-out with API Gateway's
   `@connections/{connectionId}` compatibility later via Kinesis if rooms hit a

@@ -63,6 +63,8 @@ resource "aws_iam_role_policy" "message" {
       # connections: $connect put, $disconnect delete, message get + presence update
       { Effect = "Allow", Action = ["dynamodb:PutItem", "dynamodb:GetItem", "dynamodb:UpdateItem", "dynamodb:DeleteItem"],
       Resource = aws_dynamodb_table.connections.arn },
+      # $connect counts the user's open sockets (the per-user cap)
+      { Effect = "Allow", Action = "dynamodb:Query", Resource = "${aws_dynamodb_table.connections.arn}/index/user-index" },
       { Effect = "Allow", Action = "dynamodb:PutItem", Resource = aws_dynamodb_table.messages.arn },
       { Effect = "Allow", Action = "sqs:SendMessage", Resource = aws_sqs_queue.fanout.arn },
     ]

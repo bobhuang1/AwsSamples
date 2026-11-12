@@ -52,6 +52,7 @@ public class MessageHandlerTests
         _sqs.SendMessageAsync(Arg.Any<SendMessageRequest>(), Arg.Any<CancellationToken>()).Returns(new SendMessageResponse());
         _ddb.PutItemAsync(Arg.Any<PutItemRequest>(), Arg.Any<CancellationToken>()).Returns(new PutItemResponse());
         _ddb.UpdateItemAsync(Arg.Any<UpdateItemRequest>(), Arg.Any<CancellationToken>()).Returns(new UpdateItemResponse());
+        _ddb.QueryAsync(Arg.Any<QueryRequest>(), Arg.Any<CancellationToken>()).Returns(new QueryResponse { Count = 0 }); // open sockets of the user
     }
 
     private void GivenConnection(long ttl)
@@ -80,6 +81,41 @@ public class MessageHandlerTests
         Assert.Equal("room-1", put.Item["room_id"].S);
         Assert.Equal("Ann", put.Item["nickname"].S);
         Assert.NotNull(put.Item["ttl"].N);
+    }
+
+    [Fact]
+    public async Task A_user_cannot_hold_more_than_five_sockets()
+    {
+        _ddb.QueryAsync(Arg.Any<QueryRequest>(), Arg.Any<CancellationToken>()).Returns(new QueryResponse { Count = 5 });
+
+        var res = await _handler.Handle(Support.Ws("$connect", "c6", userId: "u-1", query: new() { ["roomId"] = "room-1" }), Support.Context());
+
+        Assert.Equal(429, res.StatusCode);
+        await _ddb.DidNotReceiveWithAnyArgs().PutItemAsync(default(PutItemRequest)!, default);
+    }
+
+    [Theory]
+    [InlineData("[1,2]")]
+    [InlineData("\"hi\"")]
+    [InlineData("""{"action":"send","text":5}""")]
+    [InlineData("{not json")]
+    public async Task A_message_of_the_wrong_shape_is_a_400_not_a_500(string body)
+    {
+        GivenConnection(InHours(6));
+
+        var res = await _handler.Handle(Support.Ws("$default", "c1", body), Support.Context());
+
+        Assert.Equal(400, res.StatusCode);
+        await _sqs.DidNotReceiveWithAnyArgs().SendMessageAsync(default(SendMessageRequest)!, default);
+    }
+
+    [Fact]
+    public async Task A_non_string_action_is_unsupported_not_a_crash()
+    {
+        var res = await _handler.Handle(Support.Ws("$default", "c1", """{"action":5}"""), Support.Context());
+
+        Assert.Equal(200, res.StatusCode);
+        Assert.Contains("unsupported action", res.Body);
     }
 
     [Fact]
@@ -179,7 +215,7 @@ public class FanoutConsumerTests
     private static SQSEvent Queue(string body, string id = "m-1") => new() { Records = [new SQSEvent.SQSMessage { MessageId = id, Body = body }] };
 
     private const string Message =
-        """{"MessageId":"msg-1","RoomId":"room-1","UserId":"u-1","Nickname":"Ann","Text":"hello","CreatedAt":1760000000000}""";
+        """{"messageId":"msg-1","roomId":"room-1","userId":"u-1","nickname":"Ann","text":"hello","createdAt":1760000000000}""";
 
     private void GivenRoom(params string[] connectionIds)
         => _ddb.QueryAsync(Arg.Any<QueryRequest>(), Arg.Any<CancellationToken>())
@@ -262,5 +298,53 @@ public class FanoutConsumerTests
 
         Assert.Empty(res.BatchItemFailures);
         await _api.DidNotReceiveWithAnyArgs().PostToConnectionAsync(default!, default);
+    }
+
+    [Fact]
+    public async Task What_the_message_handler_queues_is_what_the_consumer_delivers()
+    {
+        // Producer output fed straight to the consumer: no hand-written body that could drift from the real one.
+        var sqs = Substitute.For<IAmazonSQS>();
+        string? queued = null;
+        sqs.SendMessageAsync(Arg.Do<SendMessageRequest>(r => queued = r.MessageBody), Arg.Any<CancellationToken>()).Returns(new SendMessageResponse());
+        _ddb.PutItemAsync(Arg.Any<PutItemRequest>(), Arg.Any<CancellationToken>()).Returns(new PutItemResponse());
+        _ddb.UpdateItemAsync(Arg.Any<UpdateItemRequest>(), Arg.Any<CancellationToken>()).Returns(new UpdateItemResponse());
+        _ddb.GetItemAsync(Arg.Any<GetItemRequest>(), Arg.Any<CancellationToken>()).Returns(new GetItemResponse
+        {
+            Item = new()
+            {
+                ["connection_id"] = Support.S("c1"), ["room_id"] = Support.S("room-1"), ["user_id"] = Support.S("u-1"),
+                ["nickname"] = Support.S("Ann"), ["ttl"] = Support.N(DateTimeOffset.UtcNow.AddHours(6).ToUnixTimeSeconds()),
+            },
+        });
+        await new MessageHandler(_ddb, sqs).Handle(Support.Ws("$default", "c1", """{"action":"send","text":"hello"}"""), Support.Context());
+        Assert.NotNull(queued);
+
+        GivenRoom("c1", "c2");
+        string? payload = null;
+        var posted = new List<string>();
+        _api.PostToConnectionAsync(Arg.Do<PostToConnectionRequest>(r =>
+        {
+            lock (posted) posted.Add(r.ConnectionId);
+            payload = new StreamReader(new MemoryStream(((MemoryStream)r.Data).ToArray())).ReadToEnd();
+        }), Arg.Any<CancellationToken>()).Returns(new PostToConnectionResponse());
+
+        var res = await new FanoutConsumer(_ddb, _api).Handle(Queue(queued!), Support.Context());
+
+        Assert.Empty(res.BatchItemFailures);
+        Assert.Equal(["c1", "c2"], posted.Order());
+        var sent = JsonDocument.Parse(payload!).RootElement.GetProperty("message");
+        Assert.Equal("u-1", sent.GetProperty("user_id").GetString());
+        Assert.Equal("Ann", sent.GetProperty("nickname").GetString());
+        Assert.Equal("hello", sent.GetProperty("text").GetString());
+        Assert.True(sent.GetProperty("created_at").GetInt64() > 0);
+    }
+
+    [Fact]
+    public async Task A_body_without_a_room_is_a_batch_failure()
+    {
+        var res = await new FanoutConsumer(_ddb, _api).Handle(Queue("""{"text":"x"}""", "m-3"), Support.Context());
+
+        Assert.Equal(["m-3"], res.BatchItemFailures.Select(f => f.ItemIdentifier));
     }
 }

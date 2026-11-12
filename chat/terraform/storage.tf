@@ -1,4 +1,4 @@
-# ---------- Live connections: hash connection_id, GSI by room ----------
+# ---------- Live connections: hash connection_id, GSIs by room and by user ----------
 # TTL drops clients that never sent $disconnect; the handler refreshes it
 # on activity.
 
@@ -17,9 +17,21 @@ resource "aws_dynamodb_table" "connections" {
     type = "S"
   }
 
+  attribute {
+    name = "user_id"
+    type = "S"
+  }
+
   global_secondary_index {
     name            = "room-index"
     hash_key        = "room_id"
+    projection_type = "KEYS_ONLY"
+  }
+
+  # Counts a user's open sockets at $connect (the per-user cap).
+  global_secondary_index {
+    name            = "user-index"
+    hash_key        = "user_id"
     projection_type = "KEYS_ONLY"
   }
 
@@ -31,8 +43,11 @@ resource "aws_dynamodb_table" "connections" {
 
 # ---------- Message history: hash message_id, GSI (room_id, created_at) ----------
 # The GSI is the per-room feed; creation time as range key keeps one Query as
-# the read path (descending). Retry/amplification protection is not needed
-# because there is exactly one writer per message.
+# the read path (descending). No route reads history yet, so the index only
+# projects its keys: a history route would read the full rows with BatchGetItem on
+# the table (or switch the projection to ALL together with that route).
+# Retry/amplification protection is not needed because there is exactly one
+# writer per message.
 
 resource "aws_dynamodb_table" "messages" {
   name         = "${local.unique}-messages"
@@ -58,7 +73,7 @@ resource "aws_dynamodb_table" "messages" {
     name            = "room-messages-index"
     hash_key        = "room_id"
     range_key       = "created_at"
-    projection_type = "ALL"
+    projection_type = "KEYS_ONLY"
   }
 
   ttl {

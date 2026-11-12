@@ -37,6 +37,10 @@ public sealed class MessageHandler
     private readonly string _fanoutQueueUrl   = Shared.Env("FANOUT_QUEUE_URL");
 
     private const int MaxTextLength = 2000;
+
+    // Sockets one user may hold at once. Each message is posted to every socket in the room,
+    // so an uncapped user could multiply the cost of every message.
+    private const int MaxSocketsPerUser = 5;
     private static readonly TimeSpan PresenceLease = TimeSpan.FromHours(6);
 
     private static readonly Lazy<IAmazonSQS> DefaultSqs = new(() => new AmazonSQSClient());
@@ -65,6 +69,10 @@ public sealed class MessageHandler
                 _ => await OnMessage(request, connectionId, context),
             };
         }
+        catch (JsonException)
+        {
+            return Shared.Fail(400, "malformed message");
+        }
         catch (Exception ex)
         {
             context.Logger.LogError("WS failure: {0}", ex);
@@ -90,6 +98,18 @@ public sealed class MessageHandler
             return Shared.Fail(400, "query param roomId (+ optional nickname) required");
         if (string.IsNullOrWhiteSpace(nickname) || nickname.Length > 40)
             nickname = ConnectAuthorizer.FromContext(request, "userName") ?? userId;
+
+        var open = await _ddb.QueryAsync(new QueryRequest
+        {
+            TableName = _connectionsTable,
+            IndexName = "user-index",
+            KeyConditionExpression = "user_id = :u",
+            ExpressionAttributeValues = new Dictionary<string, AttributeValue> { [":u"] = new() { S = userId } },
+            Select = Select.COUNT,
+            Limit = MaxSocketsPerUser,
+        });
+        if (open.Count >= MaxSocketsPerUser)
+            return Shared.Fail(429, "too many open connections");
 
         var now = DateTimeOffset.UtcNow;
         await _ddb.PutItemAsync(new PutItemRequest
@@ -123,10 +143,19 @@ public sealed class MessageHandler
         using var body = JsonDocument.Parse(request.Body ?? "{}");
         var root = body.RootElement;
 
-        if (!root.TryGetProperty("action", out var action) || action.GetString() != "send")
+        // Valid JSON of the wrong shape (an array, a number, "text": 5) is a client error, not a failure here.
+        if (root.ValueKind != JsonValueKind.Object)
+            return Shared.Fail(400, "message must be a JSON object");
+        if (!root.TryGetProperty("action", out var action) || action.ValueKind != JsonValueKind.String || action.GetString() != "send")
             return Shared.Ok(JsonSerializer.Serialize(new { error = "unsupported action" }));
 
-        var text = root.TryGetProperty("text", out var t) ? t.GetString() : "";
+        string? text = "";
+        if (root.TryGetProperty("text", out var t))
+        {
+            if (t.ValueKind is not (JsonValueKind.String or JsonValueKind.Null))
+                return Shared.Fail(400, "text must be a string");
+            text = t.GetString();
+        }
         if (string.IsNullOrWhiteSpace(text)) return Shared.Ok(JsonSerializer.Serialize(new { error = "empty text" }));
         if (text.Length > MaxTextLength) return Shared.Ok(JsonSerializer.Serialize(new { error = $"text too long (max {MaxTextLength})" }));
 

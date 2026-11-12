@@ -52,9 +52,12 @@ public sealed class FanoutConsumer
         {
             try
             {
-                using var message = JsonDocument.Parse(record.Body);
-                var roomId = message.RootElement.GetProperty("RoomId").GetString();
-                await Deliver(message.RootElement, roomId!, context);
+                // The producer serializes with Shared.JsonOpts (camelCase); read with the same options.
+                var message = JsonSerializer.Deserialize<Message>(record.Body, Shared.JsonOpts)
+                    ?? throw new JsonException("Empty message body");
+                if (string.IsNullOrEmpty(message.RoomId))
+                    throw new JsonException("Message has no roomId");
+                await Deliver(message, context);
             }
             catch (Exception ex)
             {
@@ -66,7 +69,7 @@ public sealed class FanoutConsumer
         return new SQSBatchResponse { BatchItemFailures = failures };
     }
 
-    private async Task Deliver(JsonElement message, string roomId, ILambdaContext context)
+    private async Task Deliver(Message message, ILambdaContext context)
     {
         // All sockets in the room (GSI, KEYS_ONLY projection, so pages are small).
         var peersIds = new List<string>();
@@ -78,7 +81,7 @@ public sealed class FanoutConsumer
                 TableName = _connectionsTable,
                 IndexName = "room-index",
                 KeyConditionExpression = "room_id = :r",
-                ExpressionAttributeValues = new Dictionary<string, AttributeValue> { [":r"] = new() { S = roomId } },
+                ExpressionAttributeValues = new Dictionary<string, AttributeValue> { [":r"] = new() { S = message.RoomId } },
                 ProjectionExpression = "connection_id",
                 ExclusiveStartKey = lastKey,
             });
@@ -93,11 +96,11 @@ public sealed class FanoutConsumer
             type = "message",
             message = new
             {
-                message_id = message.GetProperty("MessageId").GetString(),
-                user_id = message.GetProperty("UserId").GetString(),
-                nickname = message.GetProperty("Nickname").GetString(),
-                text = message.GetProperty("Text").GetString(),
-                created_at = message.GetProperty("CreatedAt").GetInt64(),
+                message_id = message.MessageId,
+                user_id = message.UserId,
+                nickname = message.Nickname,
+                text = message.Text,
+                created_at = message.CreatedAt,
             },
         });
 
