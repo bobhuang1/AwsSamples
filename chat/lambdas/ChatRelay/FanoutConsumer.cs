@@ -3,7 +3,6 @@ using System.Text.Json;
 using Amazon.ApiGatewayManagementApi;
 using Amazon.ApiGatewayManagementApi.Model;
 using Amazon.DynamoDBv2;
-using Amazon.DynamoDBv2.DocumentModel;
 using Amazon.DynamoDBv2.Model;
 using Amazon.Lambda.Core;
 using Amazon.Runtime;
@@ -27,12 +26,23 @@ public sealed class FanoutConsumer
     // taking one round trip after another without flooding the Management API.
     private const int MaxParallelPosts = 32;
 
-    private static readonly Lazy<AmazonDynamoDBClient> Ddb = new(() => new AmazonDynamoDBClient());
-
     // One client for the life of the container, so the TLS connection is reused.
-    private static AmazonApiGatewayManagementApiClient? _api;
-    private AmazonApiGatewayManagementApiClient Api =>
-        _api ??= new AmazonApiGatewayManagementApiClient(new AmazonApiGatewayManagementApiConfig { ServiceURL = _wsEndpoint });
+    private static IAmazonApiGatewayManagementApi? _sharedApi;
+
+    private readonly IAmazonDynamoDB _ddb;
+    private readonly IAmazonApiGatewayManagementApi? _injectedApi;
+
+    private IAmazonApiGatewayManagementApi Api =>
+        _injectedApi ?? (_sharedApi ??= new AmazonApiGatewayManagementApiClient(new AmazonApiGatewayManagementApiConfig { ServiceURL = _wsEndpoint }));
+
+    // The Lambda runtime uses this constructor.
+    public FanoutConsumer() : this(Shared.Ddb.Value, null) { }
+
+    public FanoutConsumer(IAmazonDynamoDB ddb, IAmazonApiGatewayManagementApi? api)
+    {
+        _ddb = ddb;
+        _injectedApi = api;
+    }
 
     public async Task<SQSBatchResponse> Handle(SQSEvent input, ILambdaContext context)
     {
@@ -63,7 +73,7 @@ public sealed class FanoutConsumer
         Dictionary<string, AttributeValue>? lastKey = null;
         do
         {
-            var q = await Ddb.Value.QueryAsync(new QueryRequest
+            var q = await _ddb.QueryAsync(new QueryRequest
             {
                 TableName = _connectionsTable,
                 IndexName = "room-index",
@@ -91,7 +101,6 @@ public sealed class FanoutConsumer
             },
         });
 
-        var connections = Table.LoadTable(Ddb.Value, _connectionsTable);
         var data = System.Text.Encoding.UTF8.GetBytes(payload);
 
         // A failure for one socket must not fail the whole message: SQS would
@@ -110,7 +119,11 @@ public sealed class FanoutConsumer
             catch (GoneException gex)
             {
                 context.Logger.LogInformation("Pruning stale connection {0} ({1})", connectionId, gex.Message);
-                await connections.DeleteItemAsync(connectionId, ct);
+                await _ddb.DeleteItemAsync(new DeleteItemRequest
+                {
+                    TableName = _connectionsTable,
+                    Key = new Dictionary<string, AttributeValue> { ["connection_id"] = new() { S = connectionId } },
+                }, ct);
             }
             catch (Exception ex) when (ex is AmazonServiceException)
             {

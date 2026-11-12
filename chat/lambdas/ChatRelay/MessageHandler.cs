@@ -1,20 +1,21 @@
 using System.Net;
 using System.Text.Json;
 using Amazon.DynamoDBv2;
-using Amazon.DynamoDBv2.DocumentModel;
+using Amazon.DynamoDBv2.Model;
 using Amazon.Lambda.APIGatewayEvents;
 using Amazon.Lambda.Core;
 using Amazon.SQS;
 using Amazon.SQS.Model;
 
 [assembly: LambdaSerializer(typeof(Amazon.Lambda.Serialization.SystemTextJson.DefaultLambdaJsonSerializer))]
+[assembly: System.Runtime.CompilerServices.InternalsVisibleTo("ChatRelay.Tests")]
 
 namespace ChatRelay;
 
 internal static class Shared
 {
     public static readonly JsonSerializerOptions JsonOpts = new(JsonSerializerDefaults.Web);
-    public static readonly Lazy<AmazonDynamoDBClient> Ddb = new(() => new AmazonDynamoDBClient());
+    public static readonly Lazy<IAmazonDynamoDB> Ddb = new(() => new AmazonDynamoDBClient());
 
     public static string Env(string name) => Environment.GetEnvironmentVariable(name) ?? "";
 
@@ -38,7 +39,19 @@ public sealed class MessageHandler
     private const int MaxTextLength = 2000;
     private static readonly TimeSpan PresenceLease = TimeSpan.FromHours(6);
 
-    private static readonly Lazy<AmazonSQSClient> Sqs = new(() => new AmazonSQSClient());
+    private static readonly Lazy<IAmazonSQS> DefaultSqs = new(() => new AmazonSQSClient());
+
+    private readonly IAmazonDynamoDB _ddb;
+    private readonly IAmazonSQS _sqs;
+
+    // The Lambda runtime uses this constructor.
+    public MessageHandler() : this(Shared.Ddb.Value, DefaultSqs.Value) { }
+
+    public MessageHandler(IAmazonDynamoDB ddb, IAmazonSQS sqs)
+    {
+        _ddb = ddb;
+        _sqs = sqs;
+    }
 
     public async Task<APIGatewayProxyResponse> Handle(APIGatewayProxyRequest request, ILambdaContext context)
     {
@@ -79,23 +92,29 @@ public sealed class MessageHandler
             nickname = ConnectAuthorizer.FromContext(request, "userName") ?? userId;
 
         var now = DateTimeOffset.UtcNow;
-        var table = Table.LoadTable(Shared.Ddb.Value, _connectionsTable);
-        await table.PutItemAsync(new Document
+        await _ddb.PutItemAsync(new PutItemRequest
         {
-            ["connection_id"] = connectionId,
-            ["user_id"]       = userId,
-            ["nickname"]      = nickname,
-            ["room_id"]       = roomId,
-            ["connected_at"]  = now.ToUnixTimeSeconds().ToString(),
-            ["ttl"]           = now.Add(PresenceLease).ToUnixTimeSeconds(), // DynamoDB TTL only honours a Number attribute
+            TableName = _connectionsTable,
+            Item = new Dictionary<string, AttributeValue>
+            {
+                ["connection_id"] = new() { S = connectionId },
+                ["user_id"]       = new() { S = userId },
+                ["nickname"]      = new() { S = nickname },
+                ["room_id"]       = new() { S = roomId },
+                ["connected_at"]  = new() { S = now.ToUnixTimeSeconds().ToString() },
+                ["ttl"]           = new() { N = now.Add(PresenceLease).ToUnixTimeSeconds().ToString() }, // DynamoDB TTL only honours a Number attribute
+            },
         });
         return Shared.Ok(JsonSerializer.Serialize(new { status = "connected", room_id = roomId }));
     }
 
     private async Task<APIGatewayProxyResponse> OnDisconnect(string connectionId)
     {
-        var table = Table.LoadTable(Shared.Ddb.Value, _connectionsTable);
-        await table.DeleteItemAsync(connectionId);
+        await _ddb.DeleteItemAsync(new DeleteItemRequest
+        {
+            TableName = _connectionsTable,
+            Key = new Dictionary<string, AttributeValue> { ["connection_id"] = new() { S = connectionId } },
+        });
         return Shared.Ok("bye");
     }
 
@@ -111,13 +130,16 @@ public sealed class MessageHandler
         if (string.IsNullOrWhiteSpace(text)) return Shared.Ok(JsonSerializer.Serialize(new { error = "empty text" }));
         if (text.Length > MaxTextLength) return Shared.Ok(JsonSerializer.Serialize(new { error = $"text too long (max {MaxTextLength})" }));
 
-        var connections = Table.LoadTable(Shared.Ddb.Value, _connectionsTable);
-        var conn = await connections.GetItemAsync(connectionId);
-        if (conn is null) return Shared.Fail(401, "not connected");
+        var connRes = await _ddb.GetItemAsync(new GetItemRequest
+        {
+            TableName = _connectionsTable,
+            Key = new Dictionary<string, AttributeValue> { ["connection_id"] = new() { S = connectionId } },
+        });
+        if (connRes.Item is not { Count: > 0 } conn) return Shared.Fail(401, "not connected");
 
-        var roomId = conn["room_id"].AsString();
-        var userId = conn["user_id"].AsString();
-        var nickname = conn["nickname"].AsString();
+        var roomId = conn["room_id"].S;
+        var userId = conn["user_id"].S;
+        var nickname = conn["nickname"].S;
         var now = DateTimeOffset.UtcNow;
 
         var message = new Message(
@@ -128,20 +150,23 @@ public sealed class MessageHandler
             Text: text,
             CreatedAt: now.ToUnixTimeMilliseconds());
 
-        var messages = Table.LoadTable(Shared.Ddb.Value, _messagesTable);
-        await messages.PutItemAsync(new Document
+        await _ddb.PutItemAsync(new PutItemRequest
         {
-            ["message_id"] = message.MessageId,
-            ["room_id"]    = message.RoomId,
-            ["user_id"]    = message.UserId,
-            ["nickname"]   = message.Nickname,
-            ["text"]       = message.Text,
-            ["created_at"] = message.CreatedAt,
-            ["ttl"]        = now.AddDays(7).ToUnixTimeSeconds(), // DynamoDB TTL only honours a Number attribute
+            TableName = _messagesTable,
+            Item = new Dictionary<string, AttributeValue>
+            {
+                ["message_id"] = new() { S = message.MessageId },
+                ["room_id"]    = new() { S = message.RoomId },
+                ["user_id"]    = new() { S = message.UserId },
+                ["nickname"]   = new() { S = message.Nickname },
+                ["text"]       = new() { S = message.Text },
+                ["created_at"] = new() { N = message.CreatedAt.ToString() },
+                ["ttl"]        = new() { N = now.AddDays(7).ToUnixTimeSeconds().ToString() }, // DynamoDB TTL only honours a Number attribute
+            },
         });
 
         // Fan-out is a queue, not a call chain: the writer returns instantly.
-        await Sqs.Value.SendMessageAsync(new SendMessageRequest
+        await _sqs.SendMessageAsync(new SendMessageRequest
         {
             QueueUrl = _fanoutQueueUrl,
             MessageBody = JsonSerializer.Serialize(message, Shared.JsonOpts),
@@ -149,19 +174,19 @@ public sealed class MessageHandler
 
         // Refresh the presence TTL, but only once half the lease is gone: a write
         // on the connections table for every chat line is not needed.
-        var currentTtl = conn.TryGetValue("ttl", out var ttlEntry) ? ttlEntry.AsLong() : 0;
+        var currentTtl = conn.TryGetValue("ttl", out var ttlEntry) && long.TryParse(ttlEntry.N, out var ttlSeconds) ? ttlSeconds : 0;
         if (currentTtl - now.ToUnixTimeSeconds() < PresenceLease.TotalSeconds / 2)
         {
-            await Shared.Ddb.Value.UpdateItemAsync(new Amazon.DynamoDBv2.Model.UpdateItemRequest
+            await _ddb.UpdateItemAsync(new UpdateItemRequest
             {
                 TableName = _connectionsTable,
-                Key = new Dictionary<string, Amazon.DynamoDBv2.Model.AttributeValue>
+                Key = new Dictionary<string, AttributeValue>
                 {
                     ["connection_id"] = new() { S = connectionId },
                 },
                 UpdateExpression = "SET #t = :t",
                 ExpressionAttributeNames = new Dictionary<string, string> { ["#t"] = "ttl" },
-                ExpressionAttributeValues = new Dictionary<string, Amazon.DynamoDBv2.Model.AttributeValue>
+                ExpressionAttributeValues = new Dictionary<string, AttributeValue>
                 {
                     [":t"] = new() { N = now.Add(PresenceLease).ToUnixTimeSeconds().ToString() },
                 },
