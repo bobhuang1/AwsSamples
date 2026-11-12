@@ -20,11 +20,11 @@ public sealed class ApiHandler
     private const int MaxQuantityPerLine = 99;
 
     /// <summary>
-    /// Checkout is one DynamoDB transaction: the order, one cart-line delete and one stock
+    /// Checkout is one DynamoDB transaction: the order, the cart delete and one stock
     /// update per product. A transaction holds at most 100 items, so a cart can have at most
-    /// (100 - 1) / 2 = 49 different products at checkout.
+    /// 100 - 2 = 98 different products at checkout.
     /// </summary>
-    internal const int MaxLinesAtCheckout = 49;
+    internal const int MaxLinesAtCheckout = 98;
 
     private const int ProductPageSize = 50;
 
@@ -152,42 +152,31 @@ public sealed class ApiHandler
 
     // ---------------- cart ----------------
     //
-    // One DynamoDB item per cart line (hash user_id, range product_id). Every cart
-    // change is a single atomic request on one line, so two requests at the same time
-    // can never overwrite each other's change the way a read-modify-write of the
-    // whole cart could.
+    // One DynamoDB item per shopper (hash user_id). Its "lines" attribute is a map keyed by
+    // product id, and every cart change is a single atomic UpdateItem on one entry of that
+    // map (plus a version counter), so two requests at the same time can never overwrite
+    // each other's change the way a read-modify-write of the whole cart could.
 
-    private async Task<List<Dictionary<string, AttributeValue>>> CartLines(string userId)
+    private const int AddAttempts = 3;
+
+    private async Task<Dictionary<string, AttributeValue>?> LoadCart(string userId)
     {
-        var lines = new List<Dictionary<string, AttributeValue>>();
-        Dictionary<string, AttributeValue>? last = null;
-        do
-        {
-            var q = await _ddb.QueryAsync(new QueryRequest
-            {
-                TableName = _cartsTable,
-                KeyConditionExpression = "user_id = :u",
-                ExpressionAttributeValues = new Dictionary<string, AttributeValue> { [":u"] = new() { S = userId } },
-                ConsistentRead = true,
-                ExclusiveStartKey = last,
-            });
-            lines.AddRange(q.Items);
-            last = q.LastEvaluatedKey is { Count: > 0 } ? q.LastEvaluatedKey : null;
-        } while (last is not null);
-        return lines;
+        var res = await _ddb.GetItemAsync(new GetItemRequest { TableName = _cartsTable, Key = Key("user_id", userId), ConsistentRead = true });
+        return res.Item is { Count: > 0 } item ? item : null;
     }
 
-    private static Cart ToCart(string userId, IEnumerable<Dictionary<string, AttributeValue>> lines)
-    {
-        var list = lines.OrderBy(l => l["product_id"].S, StringComparer.Ordinal).ToList();
-        var updated = list.Count == 0 ? null : list.Max(l => Num(l, "updated_at")).ToString(CultureInfo.InvariantCulture);
-        return new Cart(userId, list.Select(LineToItem).ToList(), updated);
-    }
+    private static List<CartItem> CartLines(Dictionary<string, AttributeValue>? cart)
+        => cart is not null && cart.TryGetValue("lines", out var lines) && lines.M is { } map
+            ? map.Values.Select(v => LineToItem(v.M)).OrderBy(i => i.ProductId, StringComparer.Ordinal).ToList()
+            : [];
+
+    private static Cart ToCart(string userId, Dictionary<string, AttributeValue>? cart)
+        => new(userId, CartLines(cart), cart is not null && cart.ContainsKey("updated_at") ? Num(cart, "updated_at").ToString(CultureInfo.InvariantCulture) : null);
 
     private async Task<APIGatewayHttpApiV2ProxyResponse> GetCart(string path)
     {
         var userId = Segment(path, 1);
-        return Ok(ToCart(userId, await CartLines(userId)));
+        return Ok(ToCart(userId, await LoadCart(userId)));
     }
 
     private async Task<APIGatewayHttpApiV2ProxyResponse> AddToCart(string path, APIGatewayHttpApiV2ProxyRequest request)
@@ -206,44 +195,70 @@ public sealed class ApiHandler
         if (res.Item is not { Count: > 0 } product) return NotFound("No product " + body.ProductId);
 
         var now = DateTimeOffset.UtcNow;
-        // One line per product: adding the same product again raises its quantity. ADD makes
-        // that increment atomic in DynamoDB, so concurrent adds are both counted. The
-        // condition keeps the line within MaxQuantityPerLine.
-        Task<UpdateItemResponse> ApplyLineUpdate(string expression, string? condition, Dictionary<string, AttributeValue> extraValues)
+        var name = Str(product, "name");
+        var price = Dec(product, "price").ToString("0.00", CultureInfo.InvariantCulture);
+        AttributeValue Line(int quantity) => new()
         {
-            var values = new Dictionary<string, AttributeValue>
+            M = new Dictionary<string, AttributeValue>
             {
-                [":n"] = new() { S = Str(product, "name") },
-                [":p"] = new() { S = Dec(product, "price").ToString("0.00", CultureInfo.InvariantCulture) },
-                [":u"] = new() { N = now.ToUnixTimeSeconds().ToString() },
-                [":t"] = new() { N = now.AddDays(7).ToUnixTimeSeconds().ToString() }, // DynamoDB TTL only honours a Number attribute
-            };
-            foreach (var (k, v) in extraValues) values[k] = v;
+                ["product_id"] = new() { S = body.ProductId },
+                ["name"]       = new() { S = name },
+                ["price"]      = new() { S = price },
+                ["quantity"]   = new() { N = quantity.ToString() },
+            },
+        };
+
+        // Each attempt is one conditional UpdateItem, so whichever state the cart is in only
+        // the matching one applies, and no attempt can overwrite a concurrent change:
+        //  1. the line exists: add to its quantity (ADD-style increment, kept within the cap)
+        //  2. the cart has lines but not this one: add the line
+        //  3. the cart has no lines map yet: create it (and the item)
+        //  4. the line exists and the increment would pass the cap: pin it at the cap
+        // A concurrent change between attempts just sends the loop around again.
+        Task<UpdateItemResponse> Apply(string set, string condition, Dictionary<string, AttributeValue> values)
+        {
+            values[":u"] = new() { N = now.ToUnixTimeSeconds().ToString() };
+            values[":t"] = new() { N = now.AddDays(7).ToUnixTimeSeconds().ToString() }; // DynamoDB TTL only honours a Number attribute
+            values[":one"] = new() { N = "1" };
             return _ddb.UpdateItemAsync(new UpdateItemRequest
             {
                 TableName = _cartsTable,
-                Key = Key("user_id", userId, "product_id", body.ProductId),
-                UpdateExpression = expression,
+                Key = Key("user_id", userId),
+                UpdateExpression = $"SET {set}, updated_at = :u, #t = :t ADD version :one",
                 ConditionExpression = condition,
-                ExpressionAttributeNames = new Dictionary<string, string> { ["#n"] = "name", ["#t"] = "ttl" },
+                ExpressionAttributeNames = new Dictionary<string, string>
+                {
+                    ["#l"] = "lines", ["#p"] = body.ProductId, ["#q"] = "quantity", ["#nm"] = "name", ["#t"] = "ttl",
+                },
                 ExpressionAttributeValues = values,
             });
         }
 
-        try
+        async Task<bool> TryApply(string set, string condition, Dictionary<string, AttributeValue> values)
         {
-            await ApplyLineUpdate("SET #n = :n, price = :p, updated_at = :u, #t = :t ADD quantity :q",
-                "attribute_not_exists(quantity) OR quantity <= :room",
-                new() { [":q"] = new() { N = body.Quantity.ToString() }, [":room"] = new() { N = (MaxQuantityPerLine - body.Quantity).ToString() } });
-        }
-        catch (ConditionalCheckFailedException)
-        {
-            // Adding would pass the cap: pin the line at the cap (idempotent, so no race either).
-            await ApplyLineUpdate("SET #n = :n, price = :p, updated_at = :u, #t = :t, quantity = :max", null,
-                new() { [":max"] = new() { N = MaxQuantityPerLine.ToString() } });
+            try { await Apply(set, condition, values); return true; }
+            catch (ConditionalCheckFailedException) { return false; }
         }
 
-        return Ok(ToCart(userId, await CartLines(userId)));
+        var applied = false;
+        for (var attempt = 0; attempt < AddAttempts && !applied; attempt++)
+        {
+            applied =
+                await TryApply("#l.#p.#q = #l.#p.#q + :q, #l.#p.#nm = :n, #l.#p.price = :pr",
+                    "attribute_exists(#l.#p) AND #l.#p.#q <= :room",
+                    new() { [":q"] = new() { N = body.Quantity.ToString() }, [":room"] = new() { N = (MaxQuantityPerLine - body.Quantity).ToString() },
+                            [":n"] = new() { S = name }, [":pr"] = new() { S = price } })
+                || await TryApply("#l.#p = :line", "attribute_exists(#l) AND attribute_not_exists(#l.#p)",
+                    new() { [":line"] = Line(body.Quantity) })
+                || await TryApply("#l = :lines", "attribute_not_exists(#l)",
+                    new() { [":lines"] = new() { M = new Dictionary<string, AttributeValue> { [body.ProductId] = Line(body.Quantity) } } })
+                || await TryApply("#l.#p.#q = :max, #l.#p.#nm = :n, #l.#p.price = :pr", "attribute_exists(#l.#p)",
+                    new() { [":max"] = new() { N = MaxQuantityPerLine.ToString() }, [":n"] = new() { S = name }, [":pr"] = new() { S = price } });
+        }
+        if (!applied)
+            return Json(new { error = "The cart is changing too fast. Please try again." }, HttpStatusCode.Conflict);
+
+        return Ok(ToCart(userId, await LoadCart(userId)));
     }
 
     private async Task<APIGatewayHttpApiV2ProxyResponse> RemoveFromCart(string path)
@@ -251,8 +266,31 @@ public sealed class ApiHandler
         var userId = Segment(path, 1);
         var productId = Segment(path, 3);
 
-        await _ddb.DeleteItemAsync(new DeleteItemRequest { TableName = _cartsTable, Key = Key("user_id", userId, "product_id", productId) });
-        return Ok(ToCart(userId, await CartLines(userId)));
+        var now = DateTimeOffset.UtcNow;
+        try
+        {
+            // One atomic REMOVE of this line. The condition makes removing a line that is not
+            // there a no-op instead of creating an empty cart item.
+            await _ddb.UpdateItemAsync(new UpdateItemRequest
+            {
+                TableName = _cartsTable,
+                Key = Key("user_id", userId),
+                UpdateExpression = "REMOVE #l.#p SET updated_at = :u, #t = :t ADD version :one",
+                ConditionExpression = "attribute_exists(#l.#p)",
+                ExpressionAttributeNames = new Dictionary<string, string> { ["#l"] = "lines", ["#p"] = productId, ["#t"] = "ttl" },
+                ExpressionAttributeValues = new Dictionary<string, AttributeValue>
+                {
+                    [":u"] = new() { N = now.ToUnixTimeSeconds().ToString() },
+                    [":t"] = new() { N = now.AddDays(7).ToUnixTimeSeconds().ToString() },
+                    [":one"] = new() { N = "1" },
+                },
+            });
+        }
+        catch (ConditionalCheckFailedException)
+        {
+            // The line was not in the cart: nothing to remove.
+        }
+        return Ok(ToCart(userId, await LoadCart(userId)));
     }
 
     // ---------------- checkout ----------------
@@ -279,12 +317,11 @@ public sealed class ApiHandler
         if (idempotencyKey is not null && await FindOrder(orderId) is { } placed)
             return PlacedOrder(placed);
 
-        var lines = await CartLines(userId);
-        if (lines.Count == 0) return BadRequest("Cart is empty");
-        if (lines.Count > MaxLinesAtCheckout)
+        var cartItem = await LoadCart(userId);
+        var items = CartLines(cartItem);
+        if (items.Count == 0) return BadRequest("Cart is empty");
+        if (items.Count > MaxLinesAtCheckout)
             return BadRequest($"A cart can hold at most {MaxLinesAtCheckout} different products at checkout");
-
-        var items = lines.Select(LineToItem).ToList();
         var total = items.Sum(i => i.Price * i.Quantity);
         var now = DateTimeOffset.UtcNow;
 
@@ -302,10 +339,11 @@ public sealed class ApiHandler
             ["ttl"]        = new() { N = now.AddDays(30).ToUnixTimeSeconds().ToString() }, // DynamoDB TTL only honours a Number attribute
         };
 
-        // One transaction: place the order, empty the cart lines we priced, and take the
-        // stock. A line is deleted only if its quantity is still what we priced, and stock
-        // is decremented only if enough is left, so a changed cart or an item that sold out
-        // meanwhile cancels the whole checkout and nothing is half-done.
+        // One transaction: place the order, delete the cart we priced, and take the stock.
+        // The cart is deleted only if its version is still the one we read (every add and
+        // remove bumps it), and stock is decremented only if enough is left, so a changed
+        // cart or an item that sold out meanwhile cancels the whole checkout and nothing is
+        // half-done.
         var transact = new List<TransactWriteItem>
         {
             new()
@@ -318,16 +356,16 @@ public sealed class ApiHandler
                 },
             },
         };
-        transact.AddRange(items.Select(i => new TransactWriteItem
+        transact.Add(new TransactWriteItem
         {
             Delete = new Delete
             {
                 TableName = _cartsTable,
-                Key = Key("user_id", userId, "product_id", i.ProductId),
-                ConditionExpression = "quantity = :q",
-                ExpressionAttributeValues = new Dictionary<string, AttributeValue> { [":q"] = new() { N = i.Quantity.ToString() } },
+                Key = Key("user_id", userId),
+                ConditionExpression = "version = :v",
+                ExpressionAttributeValues = new Dictionary<string, AttributeValue> { [":v"] = new() { N = Num(cartItem!, "version").ToString(CultureInfo.InvariantCulture) } },
             },
-        }));
+        });
         transact.AddRange(items.Select(i => new TransactWriteItem
         {
             Update = new Update
@@ -350,11 +388,11 @@ public sealed class ApiHandler
             if (idempotencyKey is not null && await FindOrder(orderId) is { } winner)
                 return PlacedOrder(winner);
 
-            // Reasons line up with the transaction items: [0] order, [1..n] cart lines, [n+1..2n] stock.
+            // Reasons line up with the transaction items: [0] order, [1] cart, [2..] stock.
             var reasons = ex.CancellationReasons ?? [];
             bool Failed(int index) => index < reasons.Count && reasons[index].Code == "ConditionalCheckFailed";
-            var cartChanged = Enumerable.Range(1, items.Count).Any(Failed);
-            var soldOut = items.Where((_, i) => Failed(1 + items.Count + i)).ToList();
+            var cartChanged = Failed(1);
+            var soldOut = items.Where((_, i) => Failed(2 + i)).ToList();
 
             if (!cartChanged && soldOut.Count > 0)
             {
@@ -390,9 +428,6 @@ public sealed class ApiHandler
     private static string Env(string name, string fallback) => Environment.GetEnvironmentVariable(name) ?? fallback;
 
     private static Dictionary<string, AttributeValue> Key(string name, string value) => new() { [name] = new() { S = value } };
-
-    private static Dictionary<string, AttributeValue> Key(string n1, string v1, string n2, string v2)
-        => new() { [n1] = new() { S = v1 }, [n2] = new() { S = v2 } };
 
     private static string Str(Dictionary<string, AttributeValue> d, string key) => d.TryGetValue(key, out var v) ? v.S ?? "" : "";
 

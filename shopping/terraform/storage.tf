@@ -25,23 +25,19 @@ resource "aws_dynamodb_table" "products" {
   }
 }
 
-# Shopping carts: one item per cart line (hash user_id, range product_id). Every
-# cart change is one atomic request on one line, so concurrent changes cannot
-# overwrite each other. Lines expire after a week of inactivity so abandoned
+# Shopping carts: one item per user (hash user_id). The lines live in a map
+# attribute (lines, keyed by product id) that the API changes with single
+# atomic UpdateItem requests, so concurrent changes cannot overwrite each other.
+# The key schema is unchanged from earlier versions, so applying does not replace
+# a deployed table. The cart expires after a week of inactivity so abandoned
 # carts collect no stale data.
 resource "aws_dynamodb_table" "carts" {
   name         = "${local.unique}-carts"
   billing_mode = "PAY_PER_REQUEST"
   hash_key     = "user_id"
-  range_key    = "product_id"
 
   attribute {
     name = "user_id"
-    type = "S"
-  }
-
-  attribute {
-    name = "product_id"
     type = "S"
   }
 
