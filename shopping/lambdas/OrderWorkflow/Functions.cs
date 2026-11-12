@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Text;
 using System.Text.Json;
 using Amazon.DynamoDBv2;
@@ -14,6 +15,7 @@ using Amazon.S3.Model;
 using Amazon.StepFunctions;
 
 [assembly: LambdaSerializer(typeof(Amazon.Lambda.Serialization.SystemTextJson.DefaultLambdaJsonSerializer))]
+[assembly: System.Runtime.CompilerServices.InternalsVisibleTo("OrderWorkflow.Tests")]
 
 namespace OrderWorkflow;
 
@@ -28,11 +30,39 @@ namespace OrderWorkflow;
 /// </summary>
 public sealed class Functions
 {
-    private static readonly Lazy<AmazonDynamoDBClient> Ddb = new(() => new AmazonDynamoDBClient());
-    private static readonly Lazy<AmazonStepFunctionsClient> Sfn = new(() => new AmazonStepFunctionsClient());
-    private static readonly Lazy<AmazonEventBridgeClient> Events = new(() => new AmazonEventBridgeClient());
-    private static readonly Lazy<AmazonS3Client> S3 = new(() => new AmazonS3Client());
-    private static readonly Lazy<AmazonSQSClient> Sqs = new(() => new AmazonSQSClient());
+    private static readonly JsonSerializerOptions JsonOpts = new(JsonSerializerDefaults.Web);
+
+    // Clients are created on first use, so each function only builds the ones it calls.
+    private readonly Lazy<IAmazonDynamoDB> _ddb;
+    private readonly Lazy<IAmazonStepFunctions> _sfn;
+    private readonly Lazy<IAmazonEventBridge> _events;
+    private readonly Lazy<IAmazonS3> _s3;
+    private readonly Lazy<IAmazonSQS> _sqs;
+
+    private IAmazonDynamoDB Ddb => _ddb.Value;
+    private IAmazonStepFunctions Sfn => _sfn.Value;
+    private IAmazonEventBridge Events => _events.Value;
+    private IAmazonS3 S3 => _s3.Value;
+    private IAmazonSQS Sqs => _sqs.Value;
+
+    // The Lambda runtime uses this constructor.
+    public Functions()
+    {
+        _ddb = new(() => new AmazonDynamoDBClient());
+        _sfn = new(() => new AmazonStepFunctionsClient());
+        _events = new(() => new AmazonEventBridgeClient());
+        _s3 = new(() => new AmazonS3Client());
+        _sqs = new(() => new AmazonSQSClient());
+    }
+
+    public Functions(IAmazonDynamoDB ddb, IAmazonSQS sqs, IAmazonStepFunctions sfn, IAmazonEventBridge events, IAmazonS3 s3)
+    {
+        _ddb = new(ddb);
+        _sqs = new(sqs);
+        _sfn = new(sfn);
+        _events = new(events);
+        _s3 = new(s3);
+    }
 
     private readonly string _ordersTable = Env("ORDERS_TABLE", "orders");
     private readonly string _stateMachine = Env("STATE_MACHINE", "");
@@ -53,14 +83,15 @@ public sealed class Functions
 
             try
             {
+                // The order row is the only copy of the order: the message is built from it here.
                 var image = record.Dynamodb.NewImage;
                 var orderId = image["order_id"].S;
-                var payload = image["payload"].S;
+                var payload = JsonSerializer.Serialize(OrderMessage.FromImage(image), JsonOpts);
 
                 // Hand the order to the durable checkout pipeline: queue -> worker -> Step Functions.
                 // The stream may deliver a record more than once; ProcessOrder's status guard
                 // makes the duplicate harmless.
-                await Sqs.Value.SendMessageAsync(new SendMessageRequest
+                await Sqs.SendMessageAsync(new SendMessageRequest
                 {
                     QueueUrl = _ordersQueue,
                     MessageBody = payload,
@@ -101,7 +132,7 @@ public sealed class Functions
                     continue;
                 }
 
-                await Sfn.Value.StartExecutionAsync(new Amazon.StepFunctions.Model.StartExecutionRequest
+                await Sfn.StartExecutionAsync(new Amazon.StepFunctions.Model.StartExecutionRequest
                 {
                     StateMachineArn = _stateMachine,
                     Name = $"order-{orderId.Substring(0, 12)}",
@@ -146,7 +177,7 @@ public sealed class Functions
             ? id.GetString() ?? "unknown"
             : "unknown";
         var day = DateTimeOffset.UtcNow.ToString("yyyy/MM/dd");
-        await S3.Value.PutObjectAsync(new PutObjectRequest
+        await S3.PutObjectAsync(new PutObjectRequest
         {
             BucketName = _auditBucket,
             Key = $"orders/{day}/{orderId}-{Guid.NewGuid():N}.json",
@@ -170,7 +201,7 @@ public sealed class Functions
 
         try
         {
-            await Ddb.Value.UpdateItemAsync(new UpdateItemRequest
+            await Ddb.UpdateItemAsync(new UpdateItemRequest
             {
                 TableName = _ordersTable,
                 Key = new Dictionary<string, AttributeValue>
@@ -191,7 +222,7 @@ public sealed class Functions
     }
 
     private Task Emit(string orderId, string detailType, string detail) =>
-        Events.Value.PutEventsAsync(new Amazon.EventBridge.Model.PutEventsRequest
+        Events.PutEventsAsync(new Amazon.EventBridge.Model.PutEventsRequest
         {
             Entries = new List<Amazon.EventBridge.Model.PutEventsRequestEntry>
             {
@@ -206,4 +237,34 @@ public sealed class Functions
         });
 
     private static string Env(string name, string fallback) => Environment.GetEnvironmentVariable(name) ?? fallback;
+}
+
+/// <summary>
+/// The order message sent to SQS and EventBridge and passed through the state machine,
+/// built from the stored order item (DynamoDB stream image).
+/// </summary>
+public sealed record OrderMessage(string order_id, string user_id, string status, DateTimeOffset created_at, decimal total, IReadOnlyList<OrderLine> items)
+{
+    public static OrderMessage FromImage(IReadOnlyDictionary<string, DynamoDBEvent.AttributeValue> image)
+    {
+        var lines = image.TryGetValue("items", out var items) && items.L is { } list
+            ? list.Select(l => OrderLine.FromAttribute(l.M)).ToList()
+            : new List<OrderLine>();
+        return new OrderMessage(
+            image["order_id"].S,
+            image["user_id"].S,
+            image["status"].S,
+            DateTimeOffset.FromUnixTimeSeconds(long.Parse(image["created_at"].S, CultureInfo.InvariantCulture)),
+            decimal.Parse(image["total"].S, CultureInfo.InvariantCulture),
+            lines);
+    }
+}
+
+public sealed record OrderLine(string ProductId, string Name, decimal Price, int Quantity)
+{
+    internal static OrderLine FromAttribute(IReadOnlyDictionary<string, DynamoDBEvent.AttributeValue> m) => new(
+        m["product_id"].S,
+        m["name"].S,
+        decimal.Parse(m["price"].S, CultureInfo.InvariantCulture),
+        int.Parse(m["quantity"].N, CultureInfo.InvariantCulture));
 }

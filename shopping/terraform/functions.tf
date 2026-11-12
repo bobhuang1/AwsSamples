@@ -11,7 +11,18 @@ locals {
     api = [
       { Effect = "Allow", Action = ["dynamodb:GetItem", "dynamodb:Scan"], Resource = aws_dynamodb_table.products.arn },
       { Effect = "Allow", Action = "dynamodb:Query", Resource = "${aws_dynamodb_table.products.arn}/index/category-index" },
-      { Effect = "Allow", Action = ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:DeleteItem"], Resource = aws_dynamodb_table.carts.arn },
+      # Checkout takes stock with a conditional update, so the API may update the stock
+      # attribute of a product (and nothing else on the catalog).
+      {
+        Effect   = "Allow"
+        Action   = "dynamodb:UpdateItem"
+        Resource = aws_dynamodb_table.products.arn
+        Condition = {
+          "ForAllValues:StringEquals" = { "dynamodb:Attributes" = ["product_id", "stock"] }
+        }
+      },
+      # Cart lines: Query (read the cart), UpdateItem (atomic add), DeleteItem (remove / checkout).
+      { Effect = "Allow", Action = ["dynamodb:Query", "dynamodb:UpdateItem", "dynamodb:DeleteItem"], Resource = aws_dynamodb_table.carts.arn },
       { Effect = "Allow", Action = ["dynamodb:GetItem", "dynamodb:PutItem"], Resource = aws_dynamodb_table.orders.arn },
     ]
     orders-outbox = [

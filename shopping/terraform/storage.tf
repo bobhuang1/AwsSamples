@@ -25,15 +25,23 @@ resource "aws_dynamodb_table" "products" {
   }
 }
 
-# Shopping carts: hash-keyed by user, items stored as a JSON list, auto-expire
-# after a week of inactivity so abandoned carts collect no stale data.
+# Shopping carts: one item per cart line (hash user_id, range product_id). Every
+# cart change is one atomic request on one line, so concurrent changes cannot
+# overwrite each other. Lines expire after a week of inactivity so abandoned
+# carts collect no stale data.
 resource "aws_dynamodb_table" "carts" {
   name         = "${local.unique}-carts"
   billing_mode = "PAY_PER_REQUEST"
   hash_key     = "user_id"
+  range_key    = "product_id"
 
   attribute {
     name = "user_id"
+    type = "S"
+  }
+
+  attribute {
+    name = "product_id"
     type = "S"
   }
 

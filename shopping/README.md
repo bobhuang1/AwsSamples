@@ -14,7 +14,7 @@ Static frontend (S3)
    |
 Browser ──► API Gateway HTTP API ──► ShoppingApi Lambda
               |  (GET /products public; everything else Cognito JWT)          online path
-              +--► DynamoDB  products | carts (TTL 7d) | orders (TTL 30d)
+              +--► DynamoDB  products | carts (one item per line, TTL 7d) | orders (TTL 30d)
                                                     |
                                        orders stream ──► OrderWorkflow.PublishOrder (outbox)
                                                     |
@@ -30,7 +30,7 @@ Browser ──► API Gateway HTTP API ──► ShoppingApi Lambda
 | Auth | Cognito user pool | JWT authorizer on the API (`$default` route) |
 | API | API Gateway HTTP API | Catch-all `$default` + public `GET /products`; CORS wide open for the sample |
 | Compute | 2 Lambda functions (`.NET 8`) | `ShoppingApi` (online), `OrderWorkflow` (SQS + SFN + EventBridge handlers, one zip) |
-| Data | DynamoDB | `products`, `carts` (TTL), `orders` (TTL + CDC stream) |
+| Data | DynamoDB | `products`, `carts` (one item per cart line, TTL), `orders` (TTL + CDC stream) |
 | Async | SQS (+DLQ) | Orders queue buffers checkout; partial batch failures via `ReportBatchItemFailures` |
 | Ops | Step Functions | Standard state machine: wait, then complete (retries, then a Fail state) |
 | Events | EventBridge | Custom bus `shop-...-orders`; `order.placed/processing/completed` events → audit |
@@ -69,9 +69,27 @@ curl "$(terraform output -raw api_endpoint)/products"
 - **Catch-all route + path dispatch.** One `$default` route, one integration,
   one deployment. The handler routes on `RawPath`, which keeps the API Gateway
   route table flat — fine up to hundreds of endpoints.
-- **Async checkout with an outbox.** `POST /orders` writes the order and
-  deletes the cart in one DynamoDB transaction and nothing else. The orders
-  table stream feeds `PublishOrder`, which sends the order to SQS (360s
+- **Atomic cart.** The cart is one DynamoDB item per line (hash `user_id`,
+  range `product_id`). Adding is a single `UpdateItem` with `ADD quantity`
+  (capped at 99 by a condition), removing is a single `DeleteItem`, so two
+  requests at the same time never overwrite each other. There is no
+  read-modify-write of the whole cart. (The carts table key changed from the
+  earlier single-item model: a deployed table is replaced by `terraform apply`,
+  which discards open carts.)
+- **Stock is checked and reserved at checkout.** `POST /orders` is one
+  DynamoDB transaction: put the order, delete each cart line (only if its
+  quantity is still what was priced) and `SET stock = stock - :q` on each
+  product with the condition `stock >= :q`. If any item is out of stock the
+  whole transaction is cancelled and the API answers `409` with an
+  `outOfStock` list; nothing is ordered and no stock is taken. A transaction
+  holds 100 items, so a cart can have at most 49 different products at
+  checkout (`400` otherwise). Stock is not given back if an order is later
+  abandoned; add a cancel step for that.
+- **Async checkout with an outbox.** The same transaction is all the API
+  does. The order row is the only copy of the order (there is no duplicate
+  `payload` attribute). The orders
+  table stream feeds `PublishOrder`, which builds the order message from the
+  stream image, sends it to SQS (360s
   visibility, 5 max receives, DLQ) and EventBridge, retrying from the stream on
   failure, so a stored order is always processed. Send an `Idempotency-Key`
   header to make checkout retries return the original order. Status changes
@@ -100,7 +118,8 @@ curl "$(terraform output -raw api_endpoint)/products"
 ## Identity
 
 The API Gateway JWT authorizer only proves that *a* shopper is signed in, so the
-handler takes the shopper's id from the token's `sub` claim: `/cart/{userId}` answers
+handler takes the shopper's id from the token's `sub` claim: `/cart/{userId}` (and
+`/cart/{userId}/items/{productId}` for removing a line) answers
 403 unless `{userId}` is the caller's own `sub`, and `POST /orders` always checks out
 the caller's own cart (a `userId` in the body is ignored). Cart quantities must be
 1-99, and adding a product that is already in the cart raises its quantity.
