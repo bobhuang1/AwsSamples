@@ -1,0 +1,137 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+permissions:
+  contents: read
+
+# A newer push to the same branch or PR cancels the run in progress.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Builds every Lambda project of a sample, runs its unit tests, and fails on
+  # known-vulnerable packages. Restores are locked to packages.lock.json.
+  dotnet:
+    name: .NET (${{ matrix.sample }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        sample: [shopping, gaming, chat]
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4.3.1
+        with:
+          dotnet-version: 8.0.x
+          cache: true # NuGet packages, keyed on the lock files
+          cache-dependency-path: ${{ matrix.sample }}/lambdas/**/packages.lock.json
+
+      - name: Restore (locked)
+        run: |
+          for proj in ${{ matrix.sample }}/lambdas/*/*.csproj; do
+            dotnet restore "$proj" --locked-mode
+          done
+
+      - name: Build Lambda projects
+        run: |
+          for proj in ${{ matrix.sample }}/lambdas/*/*.csproj; do
+            case "$proj" in *.Tests/*) continue ;; esac
+            dotnet build "$proj" -c Release --no-restore
+          done
+
+      - name: Test
+        run: |
+          for proj in ${{ matrix.sample }}/lambdas/*.Tests/*.csproj; do
+            dotnet test "$proj" -c Release --no-restore
+          done
+
+      - name: Vulnerable packages
+        run: |
+          status=0
+          for proj in ${{ matrix.sample }}/lambdas/*/*.csproj; do
+            case "$proj" in *.Tests/*) continue ;; esac
+            out=$(dotnet list "$proj" package --vulnerable --include-transitive 2>&1)
+            echo "$out"
+            if echo "$out" | grep -q "has the following vulnerable packages"; then status=1; fi
+          done
+          exit $status
+
+  # fmt, validate, tflint and checkov for each sample. Nothing here touches AWS:
+  # `init -backend=false` only downloads providers, and validate needs the Lambda
+  # zip files to exist, so empty placeholders stand in for them.
+  terraform:
+    name: Terraform (${{ matrix.sample }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        sample: [shopping, gaming, chat]
+    defaults:
+      run:
+        working-directory: ${{ matrix.sample }}/terraform
+    env:
+      TF_PLUGIN_CACHE_DIR: ${{ github.workspace }}/.terraform-plugin-cache
+      TFLINT_PLUGIN_DIR: ${{ github.workspace }}/.tflint-plugins
+      TF_IN_AUTOMATION: "true"
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: |
+            ${{ github.workspace }}/.terraform-plugin-cache
+            ${{ github.workspace }}/.tflint-plugins
+          key: tf-plugins-${{ runner.os }}-${{ hashFiles('.tflint.hcl', format('{0}/terraform/.terraform.lock.hcl', matrix.sample)) }}
+
+      - uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3.1.2
+        with:
+          terraform_version: 1.9.8
+          terraform_wrapper: false
+
+      - name: Format
+        run: terraform fmt -check -recursive -diff
+
+      - name: Init (no backend)
+        run: |
+          mkdir -p "$TF_PLUGIN_CACHE_DIR"
+          terraform init -backend=false -input=false
+
+      - name: Validate
+        run: |
+          mkdir -p dist
+          echo placeholder > "$RUNNER_TEMP/placeholder.txt"
+          for zip in $(grep -oh 'dist/[A-Za-z0-9_.-]*\.zip' *.tf | sort -u); do
+            zip -qj "$zip" "$RUNNER_TEMP/placeholder.txt"
+          done
+          terraform validate
+
+      - uses: terraform-linters/setup-tflint@90f302c255ef959cbfb4bd10581afecdb7ece3e6 # v4.1.1
+        with:
+          tflint_version: v0.66.0
+
+      - name: tflint
+        env:
+          GITHUB_TOKEN: ${{ github.token }} # lets `tflint --init` download the plugins without hitting rate limits
+        run: |
+          mkdir -p "$TFLINT_PLUGIN_DIR"
+          tflint --init --config ../../.tflint.hcl
+          tflint --config ../../.tflint.hcl
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: .github/requirements-checkov.txt
+
+      - name: checkov
+        run: |
+          pip install -r ../../.github/requirements-checkov.txt
+          checkov --directory . --framework terraform --config-file ../../.checkov.yaml --compact --quiet

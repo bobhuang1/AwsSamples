@@ -46,9 +46,29 @@ README. `terraform destroy` tears everything down.
 ## Demo scope and security
 
 These are demo stacks. They deploy with open Cognito self-sign-up, no MFA, wide-open
-CORS, throttling only at the API stage, and a score-reporting endpoint that trusts the
-client (the leaderboard score is client-reported). Do not point real users or real data
-at them as they are, and tear them down (`terraform destroy`) when you are finished.
+CORS, and throttling only at the API stage. Leaderboard scores are computed by the
+backend from match results reported by the game server, not taken from players. Do not
+point real users or real data at them as they are, and tear them down
+(`terraform destroy`) when you are finished.
+
+## Tests and CI
+
+Each Lambda project has an xUnit project next to it (`*.Tests`) that runs without AWS:
+the DynamoDB, SQS, S3, Step Functions, EventBridge and API Gateway clients are mocked.
+
+```powershell
+dotnet test gaming/lambdas/GameBackend.Tests    # likewise ShoppingApi.Tests, OrderWorkflow.Tests, ChatRelay.Tests
+```
+
+NuGet packages are pinned in `packages.lock.json` files (`RestorePackagesWithLockFile`
+in `Directory.Build.props`); after changing a package reference run
+`dotnet restore --force-evaluate` and commit the updated lock file.
+
+`.github/workflows/ci.yml` runs for every sample: build and test the Lambda projects
+(locked restore, vulnerable-package check) and, for the Terraform, `terraform fmt -check`,
+`terraform init -backend=false`, `terraform validate`, `tflint` (`.tflint.hcl`) and
+`checkov` (`.checkov.yaml`). Nothing in CI needs AWS credentials. Intentional exceptions
+are suppressed next to the code with a reason.
 
 ## Hardening / multi-region notes
 

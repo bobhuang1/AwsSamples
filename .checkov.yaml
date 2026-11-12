@@ -1,0 +1,51 @@
+# checkov configuration shared by the three samples (run from each sample's terraform folder):
+#   checkov --directory . --config-file ../../.checkov.yaml
+#
+# These are demo stacks that favour a low bill and a readable configuration over every
+# production control. Each check skipped here is skipped on purpose, for the reason next
+# to it; resource-specific exceptions are annotated in the Terraform itself
+# ("# checkov:skip=<id>: <reason>"). Before using a stack for real data, revisit this list.
+framework:
+  - terraform
+compact: true
+quiet: true
+skip-download: true
+
+skip-check:
+  # --- Lambda ---
+  - CKV_AWS_50   # X-Ray tracing: CloudWatch logs and metrics are enough for the samples; turning it on needs extra role permissions and costs per trace
+  - CKV_AWS_115  # Reserved concurrency: reserving it can fail in a new account when it would leave the account under its minimum of 100 unreserved concurrent executions; throttling is set on the API stages instead
+  - CKV_AWS_116  # Lambda DLQ: failures of the stream/queue consumers are handled by SQS redrive, partial batch responses and event-source-mapping failure destinations; API handlers return the error to the caller
+  - CKV_AWS_117  # Inside a VPC: the functions only call AWS public service endpoints, and a VPC would need NAT or endpoints (cost) for no isolation benefit
+  - CKV_AWS_173  # Customer-managed key for environment variables: the variables hold table and queue names, no secrets; they are already encrypted at rest with the AWS managed key
+  - CKV_AWS_272  # Code signing: needs a signing profile and pipeline; out of scope for a sample
+
+  # --- CloudWatch Logs ---
+  - CKV_AWS_158  # KMS on log groups: the default CloudWatch Logs encryption is enough, and the logs carry no personal data (the WebSocket token is never logged)
+  - CKV_AWS_338  # Retain logs for a year: 14 days is chosen to keep the bill low (see retention_in_days)
+
+  # --- DynamoDB ---
+  - CKV_AWS_28   # Point-in-time recovery: kept on for products and orders (the data worth restoring); the other tables hold carts, queue slots, connections and similar short-lived TTL data
+  - CKV_AWS_119  # Customer-managed KMS key: tables use the default AWS owned key encryption; a CMK adds a monthly fee and per-request charges
+
+  # --- Kinesis ---
+  # (CKV_AWS_185, customer-managed key, is annotated on the stream itself)
+
+  # --- S3 ---
+  - CKV_AWS_18   # Access logging: needs a second bucket; the buckets are private, written only by the stack and expire their objects
+  - CKV_AWS_144  # Cross-region replication: the samples are single-region by design
+  - CKV_AWS_145  # KMS default encryption: SSE-S3 (the default) is applied; SSE-KMS adds request charges
+  - CKV2_AWS_62  # Event notifications: nothing consumes bucket events
+
+  # --- API Gateway ---
+  - CKV_AWS_76   # Access logging: the WebSocket handshake carries the token in ?token=, which would be written to the access log; the HTTP APIs are rate limited at the stage and logged by the Lambdas
+  - CKV2_AWS_51  # Client certificates: browsers and game clients cannot present them; callers authenticate with Cognito JWTs (or SigV4 for the game server)
+
+  # --- CloudFront / WAF (shopping frontend) ---
+  - CKV_AWS_86   # CloudFront access logging: needs a log bucket with ACLs enabled; not worth it for a static demo page
+  - CKV_AWS_310  # Origin failover: a single private S3 origin
+  - CKV_AWS_374  # Geo restriction: the demo has no market restriction
+  - CKV2_AWS_32  # Response headers policy: add one together with a real domain and content security policy
+  - CKV_AWS_174  # TLS 1.2 minimum: needs a custom domain and ACM certificate; with the default *.cloudfront.net certificate CloudFront keeps its own minimum
+  - CKV2_AWS_42  # Custom SSL certificate: needs a domain name, which a sample cannot assume
+  - CKV2_AWS_31  # WAF logging: needs a log destination with the aws-waf-logs- prefix; sampled requests are enabled on every rule instead
