@@ -1,12 +1,44 @@
 # ---------- Shared pieces ----------
 
-resource "aws_cloudwatch_log_group" "api" {
-  name              = "/aws/lambda/${local.unique}-api"
-  retention_in_days = 14
+locals {
+  # One log group, one role and one function per name. A function's log group
+  # must be named exactly /aws/lambda/<function name>: that is the only group
+  # Lambda writes to.
+  lambda_names = ["api", "orders-outbox", "orders-worker", "orders-complete", "orders-audit"]
+
+  # Only the calls each function makes (checked against the handler code).
+  lambda_statements = {
+    api = [
+      { Effect = "Allow", Action = ["dynamodb:GetItem", "dynamodb:Scan"], Resource = aws_dynamodb_table.products.arn },
+      { Effect = "Allow", Action = "dynamodb:Query", Resource = "${aws_dynamodb_table.products.arn}/index/category-index" },
+      { Effect = "Allow", Action = ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:DeleteItem"], Resource = aws_dynamodb_table.carts.arn },
+      { Effect = "Allow", Action = ["dynamodb:GetItem", "dynamodb:PutItem"], Resource = aws_dynamodb_table.orders.arn },
+    ]
+    orders-outbox = [
+      { Effect = "Allow", Action = ["dynamodb:DescribeStream", "dynamodb:GetRecords", "dynamodb:GetShardIterator"], Resource = aws_dynamodb_table.orders.stream_arn },
+      { Effect = "Allow", Action = "dynamodb:ListStreams", Resource = "*" },
+      { Effect = "Allow", Action = "sqs:SendMessage", Resource = aws_sqs_queue.orders.arn },
+      { Effect = "Allow", Action = "events:PutEvents", Resource = aws_cloudwatch_event_bus.orders.arn },
+    ]
+    orders-worker = [
+      { Effect = "Allow", Action = "dynamodb:UpdateItem", Resource = aws_dynamodb_table.orders.arn },
+      { Effect = "Allow", Action = ["sqs:ReceiveMessage", "sqs:DeleteMessage", "sqs:GetQueueAttributes"], Resource = aws_sqs_queue.orders.arn },
+      { Effect = "Allow", Action = "states:StartExecution", Resource = aws_sfn_state_machine.orders.arn },
+      { Effect = "Allow", Action = "events:PutEvents", Resource = aws_cloudwatch_event_bus.orders.arn },
+    ]
+    orders-complete = [
+      { Effect = "Allow", Action = "dynamodb:UpdateItem", Resource = aws_dynamodb_table.orders.arn },
+      { Effect = "Allow", Action = "events:PutEvents", Resource = aws_cloudwatch_event_bus.orders.arn },
+    ]
+    orders-audit = [
+      { Effect = "Allow", Action = "s3:PutObject", Resource = "${aws_s3_bucket.audit.arn}/*" },
+    ]
+  }
 }
 
-resource "aws_cloudwatch_log_group" "orders" {
-  name              = "/aws/lambda/${local.unique}-orders"
+resource "aws_cloudwatch_log_group" "lambda" {
+  for_each          = toset(local.lambda_names)
+  name              = "/aws/lambda/${local.unique}-${each.key}"
   retention_in_days = 14
 }
 
@@ -20,50 +52,23 @@ data "aws_iam_policy_document" "lambda_assume" {
   }
 }
 
-resource "aws_iam_role" "api" {
-  name               = "${local.unique}-api-role"
+resource "aws_iam_role" "lambda" {
+  for_each           = toset(local.lambda_names)
+  name               = "${local.unique}-${each.key}-role"
   assume_role_policy = data.aws_iam_policy_document.lambda_assume.json
 }
 
-resource "aws_iam_role_policy" "api" {
-  name = "api-policy"
-  role = aws_iam_role.api.id
+resource "aws_iam_role_policy" "lambda" {
+  for_each = toset(local.lambda_names)
+  name     = "${each.key}-policy"
+  role     = aws_iam_role.lambda[each.key].id
 
   policy = jsonencode({
     Version = "2012-10-17"
-    Statement = [
-      { Effect = "Allow", Action = "logs:CreateLogStream", Resource = aws_cloudwatch_log_group.api.arn },
-      { Effect = "Allow", Action = ["logs:PutLogEvents"], Resource = "${aws_cloudwatch_log_group.api.arn}:*" },
-      { Effect = "Allow", Action = ["dynamodb:GetItem", "dynamodb:Query", "dynamodb:Scan", "dynamodb:PutItem", "dynamodb:UpdateItem", "dynamodb:DeleteItem"],
-      Resource = [aws_dynamodb_table.products.arn, aws_dynamodb_table.carts.arn, aws_dynamodb_table.orders.arn, "${aws_dynamodb_table.products.arn}/index/*", "${aws_dynamodb_table.carts.arn}/index/*", "${aws_dynamodb_table.orders.arn}/index/*"] },
-    ]
-  })
-}
-
-resource "aws_iam_role" "orders" {
-  name               = "${local.unique}-orders-role"
-  assume_role_policy = data.aws_iam_policy_document.lambda_assume.json
-}
-
-resource "aws_iam_role_policy" "orders" {
-  name = "orders-policy"
-  role = aws_iam_role.orders.id
-
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      { Effect = "Allow", Action = "logs:CreateLogStream", Resource = aws_cloudwatch_log_group.orders.arn },
-      { Effect = "Allow", Action = ["logs:PutLogEvents"], Resource = "${aws_cloudwatch_log_group.orders.arn}:*" },
-      { Effect = "Allow", Action = ["dynamodb:GetItem", "dynamodb:UpdateItem"],
-      Resource = [aws_dynamodb_table.orders.arn, "${aws_dynamodb_table.orders.arn}/index/*"] },
-      { Effect = "Allow", Action = ["sqs:ReceiveMessage", "sqs:DeleteMessage", "sqs:GetQueueAttributes", "sqs:SendMessage"],
-      Resource = aws_sqs_queue.orders.arn },
-      { Effect = "Allow", Action = ["dynamodb:DescribeStream", "dynamodb:GetRecords", "dynamodb:GetShardIterator", "dynamodb:ListStreams"],
-      Resource = aws_dynamodb_table.orders.stream_arn },
-      { Effect = "Allow", Action = "states:StartExecution", Resource = aws_sfn_state_machine.orders.arn },
-      { Effect = "Allow", Action = "events:PutEvents", Resource = aws_cloudwatch_event_bus.orders.arn },
-      { Effect = "Allow", Action = ["s3:PutObject"], Resource = "${aws_s3_bucket.audit.arn}/*" },
-    ]
+    Statement = concat([
+      { Effect = "Allow", Action = "logs:CreateLogStream", Resource = aws_cloudwatch_log_group.lambda[each.key].arn },
+      { Effect = "Allow", Action = "logs:PutLogEvents", Resource = "${aws_cloudwatch_log_group.lambda[each.key].arn}:*" },
+    ], local.lambda_statements[each.key])
   })
 }
 
@@ -71,13 +76,14 @@ resource "aws_iam_role_policy" "orders" {
 
 resource "aws_lambda_function" "api" {
   function_name    = "${local.unique}-api"
-  role             = aws_iam_role.api.arn
+  role             = aws_iam_role.lambda["api"].arn
   runtime          = "dotnet8"
   handler          = "ShoppingApi::ShoppingApi.ApiHandler::Handle"
   filename         = "${path.module}/dist/ShoppingApi.zip"
   source_code_hash = filebase64sha256("${path.module}/dist/ShoppingApi.zip")
   timeout          = 30
   memory_size      = 512
+  depends_on       = [aws_cloudwatch_log_group.lambda["api"]]
 
   environment {
     variables = {
@@ -95,13 +101,14 @@ resource "aws_lambda_function" "api" {
 
 resource "aws_lambda_function" "orders_outbox" {
   function_name    = "${local.unique}-orders-outbox"
-  role             = aws_iam_role.orders.arn
+  role             = aws_iam_role.lambda["orders-outbox"].arn
   runtime          = "dotnet8"
   handler          = "OrderWorkflow::OrderWorkflow.Functions::PublishOrder"
   filename         = "${path.module}/dist/OrderWorkflow.zip"
   source_code_hash = filebase64sha256("${path.module}/dist/OrderWorkflow.zip")
   timeout          = 60
   memory_size      = 256
+  depends_on       = [aws_cloudwatch_log_group.lambda["orders-outbox"]]
 
   environment {
     variables = {
@@ -129,13 +136,14 @@ resource "aws_lambda_event_source_mapping" "orders_outbox" {
 
 resource "aws_lambda_function" "orders_worker" {
   function_name    = "${local.unique}-orders-worker"
-  role             = aws_iam_role.orders.arn
+  role             = aws_iam_role.lambda["orders-worker"].arn
   runtime          = "dotnet8"
   handler          = "OrderWorkflow::OrderWorkflow.Functions::ProcessOrder"
   filename         = "${path.module}/dist/OrderWorkflow.zip"
   source_code_hash = filebase64sha256("${path.module}/dist/OrderWorkflow.zip")
   timeout          = 60
   memory_size      = 512
+  depends_on       = [aws_cloudwatch_log_group.lambda["orders-worker"]]
 
   environment {
     variables = {
@@ -148,13 +156,14 @@ resource "aws_lambda_function" "orders_worker" {
 
 resource "aws_lambda_function" "orders_complete" {
   function_name    = "${local.unique}-orders-complete"
-  role             = aws_iam_role.orders.arn
+  role             = aws_iam_role.lambda["orders-complete"].arn
   runtime          = "dotnet8"
   handler          = "OrderWorkflow::OrderWorkflow.Functions::CompleteOrder"
   filename         = "${path.module}/dist/OrderWorkflow.zip"
   source_code_hash = filebase64sha256("${path.module}/dist/OrderWorkflow.zip")
   timeout          = 60
   memory_size      = 512
+  depends_on       = [aws_cloudwatch_log_group.lambda["orders-complete"]]
 
   environment {
     variables = {
@@ -166,13 +175,14 @@ resource "aws_lambda_function" "orders_complete" {
 
 resource "aws_lambda_function" "orders_audit" {
   function_name    = "${local.unique}-orders-audit"
-  role             = aws_iam_role.orders.arn
+  role             = aws_iam_role.lambda["orders-audit"].arn
   runtime          = "dotnet8"
   handler          = "OrderWorkflow::OrderWorkflow.Functions::AuditOrder"
   filename         = "${path.module}/dist/OrderWorkflow.zip"
   source_code_hash = filebase64sha256("${path.module}/dist/OrderWorkflow.zip")
   timeout          = 60
   memory_size      = 256
+  depends_on       = [aws_cloudwatch_log_group.lambda["orders-audit"]]
 
   environment {
     variables = {

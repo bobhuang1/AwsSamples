@@ -1,7 +1,8 @@
 # WAF at the edge (CloudFront). Managed rules kill the common attack classes;
 # the rate-based rule protects against credential-stuffing / scraper bursts.
-# The API Gateway stage lives behind CloudFront in production; a regional ACL
-# can be attached per-stage with aws_wafv2_web_acl_association.
+# This ACL protects the static frontend only. AWS WAF cannot be associated with
+# an HTTP API; the API is protected by stage throttling (api.tf) and Cognito.
+# To put the WAF in front of the API, route it through this distribution.
 
 resource "aws_wafv2_web_acl" "cloudfront" {
   name        = "${local.unique}-cloudfront-waf"

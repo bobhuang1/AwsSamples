@@ -26,15 +26,15 @@ Browser ──► API Gateway HTTP API ──► ShoppingApi Lambda
 
 | Layer | Service | Notes |
 | --- | --- | --- |
-| Edge | CloudFront + AWS WAF | Managed Core rule set + IP rate limit; serves the S3 website |
+| Edge | CloudFront + AWS WAF | Managed Core rule set + IP rate limit; serves the private S3 bucket via Origin Access Control |
 | Auth | Cognito user pool | JWT authorizer on the API (`$default` route) |
 | API | API Gateway HTTP API | Catch-all `$default` + public `GET /products`; CORS wide open for the sample |
 | Compute | 2 Lambda functions (`.NET 8`) | `ShoppingApi` (online), `OrderWorkflow` (SQS + SFN + EventBridge handlers, one zip) |
-| Data | DynamoDB | `products`, `carts` (TTL), `orders` (TTL + CDC stream + GSI by user) |
+| Data | DynamoDB | `products`, `carts` (TTL), `orders` (TTL + CDC stream) |
 | Async | SQS (+DLQ) | Orders queue buffers checkout; partial batch failures via `ReportBatchItemFailures` |
-| Ops | Step Functions | Standard state machine: wait, then complete |
+| Ops | Step Functions | Standard state machine: wait, then complete (retries, then a Fail state) |
 | Events | EventBridge | Custom bus `shop-...-orders`; `order.placed/processing/completed` events → audit |
-| Archive | S3 | Audit bucket, versioned, public access blocked |
+| Archive | S3 | Audit bucket, public access blocked, objects expire after `audit_retention_days` |
 
 ## Deploy
 
@@ -49,7 +49,8 @@ terraform apply
 ```
 
 `terraform outputs` prints the website URL, API endpoint, and Cognito ids.
-Upload the frontend, seed the catalog, then try the API:
+`terraform apply` also uploads `frontend/index.html` to the (private) frontend bucket;
+it is served only through CloudFront. Seed the catalog, then try the API:
 
 ```powershell
 # seed a few products (replace the payload with your own)
@@ -70,7 +71,7 @@ curl "$(terraform output -raw api_endpoint)/products"
   route table flat — fine up to hundreds of endpoints.
 - **Async checkout with an outbox.** `POST /orders` writes the order and
   deletes the cart in one DynamoDB transaction and nothing else. The orders
-  table stream feeds `PublishOrder`, which sends the order to SQS (90s
+  table stream feeds `PublishOrder`, which sends the order to SQS (360s
   visibility, 5 max receives, DLQ) and EventBridge, retrying from the stream on
   failure, so a stored order is always processed. Send an `Idempotency-Key`
   header to make checkout retries return the original order. Status changes
@@ -81,8 +82,9 @@ curl "$(terraform output -raw api_endpoint)/products"
 - **Events, not calls.** Checkout emits events on a custom bus; the audit trail,
   email, search, and BI consumers subscribe separately and fail independently.
 - **WAF at the edge.** Managed rule set plus an IP rate limit on CloudFront
-  covers the static tier; a regional ACL can be joined to the API later via
-  `aws_wafv2_web_acl_association`.
+  covers the static tier only. AWS WAF cannot be attached to an HTTP API, so the
+  API is protected by stage throttling and the Cognito JWT authorizer; to put the
+  WAF in front of it, route the API through the CloudFront distribution.
 
 ## Grow it further
 

@@ -38,11 +38,16 @@
       try {
         const products = await req("/products");
         $("#out").textContent = JSON.stringify(products, null, 2);
-        $("#catalog").innerHTML =
-          "<tr><th>id</th><th>name</th><th>category</th><th>price</th></tr>" +
-          products.map(p =>
-            `<tr><td>${p.product_id}</td><td>${p.name}</td><td>${p.category}</td><td>${p.price}</td></tr>`
-          ).join("");
+        // Build cells with textContent: catalog fields are data, never markup.
+        const table = $("#catalog");
+        table.replaceChildren();
+        const addRow = (cells, tag) => {
+          const tr = document.createElement("tr");
+          for (const v of cells) { const c = document.createElement(tag); c.textContent = v ?? ""; tr.append(c); }
+          table.append(tr);
+        };
+        addRow(["id", "name", "category", "price"], "th");
+        for (const p of products) addRow([p.product_id, p.name, p.category, p.price], "td");
       } catch (e) {
         $("#out").textContent = "Error: " + e.message;
       }

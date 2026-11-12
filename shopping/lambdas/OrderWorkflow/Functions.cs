@@ -64,7 +64,6 @@ public sealed class Functions
                 {
                     QueueUrl = _ordersQueue,
                     MessageBody = payload,
-                    MessageGroupId = image["user_id"].S,
                 });
 
                 // Announce it on the event bus for downstream consumers (search, BI, email...).

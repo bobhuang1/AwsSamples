@@ -18,6 +18,9 @@ public sealed class ApiHandler
 
     private const int MaxQuantityPerLine = 99;
 
+    // The catalog is public and read far more often than it changes; stock is live, so keep this short.
+    private const int CatalogCacheSeconds = 30;
+
     private static readonly Lazy<AmazonDynamoDBClient> Ddb = new(() => new AmazonDynamoDBClient());
 
     private readonly string _productsTable = Env("PRODUCTS_TABLE", "products");
@@ -28,7 +31,7 @@ public sealed class ApiHandler
     {
         try
         {
-            var (method, path) = (request.RequestContext.Http.Method, request.RawPath);
+            var (method, path) = (request.RequestContext.Http.Method, RoutePath(request));
 
             return (method, path) switch
             {
@@ -46,6 +49,23 @@ public sealed class ApiHandler
             context.Logger.LogError("Handler failure: {0}", ex);
             return Json(new { error = "Internal error" }, HttpStatusCode.InternalServerError);
         }
+    }
+
+    /// <summary>
+    /// The request path without the API stage. With a named stage (not $default) HTTP APIs
+    /// put the stage in front of rawPath (/v1/products); routes are matched without it.
+    /// </summary>
+    internal static string RoutePath(APIGatewayHttpApiV2ProxyRequest request)
+    {
+        var path = request.RawPath ?? "/";
+        var stage = request.RequestContext?.Stage;
+        if (!string.IsNullOrEmpty(stage) && stage != "$default")
+        {
+            var prefix = "/" + stage;
+            if (path == prefix) return "/";
+            if (path.StartsWith(prefix + "/", StringComparison.Ordinal)) return path[prefix.Length..];
+        }
+        return path;
     }
 
     // ---------------- caller identity ----------------
@@ -80,7 +100,7 @@ public sealed class ApiHandler
             ? await table.Scan(new ScanOperationConfig { ConsistentRead = false, Limit = 50 }).GetRemainingAsync()
             : await table.Query($"category-index", new QueryFilter("category", QueryOperator.Equal, category)).GetRemainingAsync();
 
-        return Json(Ok(docs.Select(DocToProduct).ToList()));
+        return Json(Ok(docs.Select(DocToProduct).ToList()), HttpStatusCode.OK, CatalogCacheSeconds);
     }
 
     private Task<APIGatewayHttpApiV2ProxyResponse> GetProduct(string path)
@@ -93,7 +113,7 @@ public sealed class ApiHandler
     {
         var table = Table.LoadTable(Ddb.Value, _productsTable);
         var doc = await table.GetItemAsync(id);
-        return doc is null ? Json(NotFound("No product " + id)) : Json(Ok(DocToProduct(doc)));
+        return doc is null ? Json(NotFound("No product " + id)) : Json(Ok(DocToProduct(doc)), HttpStatusCode.OK, CatalogCacheSeconds);
     }
 
     private async Task<APIGatewayHttpApiV2ProxyResponse> GetCart(string path)
@@ -109,8 +129,11 @@ public sealed class ApiHandler
     private async Task<APIGatewayHttpApiV2ProxyResponse> AddToCart(string path, APIGatewayHttpApiV2ProxyRequest request)
     {
         var userId = Segment(path, 2);
-        var body = JsonSerializer.Deserialize<AddItemRequest>(request.Body, JsonOpts)
-            ?? throw new InvalidOperationException("Body must be { productId, quantity }");
+        AddItemRequest? body;
+        try { body = string.IsNullOrWhiteSpace(request.Body) ? null : JsonSerializer.Deserialize<AddItemRequest>(request.Body, JsonOpts); }
+        catch (JsonException) { body = null; }
+        if (body is null || string.IsNullOrEmpty(body.ProductId))
+            return Json(BadRequest("Body must be { productId, quantity }"));
         if (body.Quantity is < 1 or > MaxQuantityPerLine)
             return Json(BadRequest($"quantity must be between 1 and {MaxQuantityPerLine}"));
 
@@ -164,6 +187,7 @@ public sealed class ApiHandler
             ["user_id"]    = userId,
             ["items"]      = items,
             ["updated_at"] = DateTimeOffset.UtcNow.ToUnixTimeSeconds().ToString(),
+            ["ttl"]        = (DateTimeOffset.UtcNow.AddDays(7)).ToUnixTimeSeconds(), // PutItem replaces the item, so the TTL must be written again
         };
         await cart.PutItemAsync(doc);
         return Json(Ok(new Cart(userId, items.Select(ItemFromDoc).ToList(), doc["updated_at"].AsString())));
@@ -174,13 +198,6 @@ public sealed class ApiHandler
         // The order is always placed for the signed-in caller; a userId in the body is ignored.
         var userId = CallerId(request);
         if (userId is null) return Json(new { error = "Sign in required." }, HttpStatusCode.Unauthorized);
-
-        var cart = Table.LoadTable(Ddb.Value, _cartsTable);
-        var existing = await cart.GetItemAsync(userId);
-        var items = existing is { Count: > 0 } && existing.Contains("items")
-            ? (existing["items"] as DynamoDBList)!.AsListOfDocument().Select(ItemFromDoc).ToList()
-            : new List<CartItem>();
-        if (items.Count == 0) return Json(BadRequest("Cart is empty"));
 
         // An Idempotency-Key header makes checkout safe to retry: the same key from the same
         // shopper always maps to the same order id, so a retry returns the first order
@@ -194,8 +211,17 @@ public sealed class ApiHandler
 
         var orderId = idempotencyKey is null ? Guid.NewGuid().ToString("N") : OrderIdFor(userId, idempotencyKey);
         var orders = Table.LoadTable(Ddb.Value, _ordersTable);
+        // Look the key up before reading the cart: on a retry of a checkout that already
+        // succeeded the cart is empty, and the client must get the original order back.
         if (idempotencyKey is not null && await orders.GetItemAsync(orderId) is { } placed)
             return PlacedOrder(placed);
+
+        var cart = Table.LoadTable(Ddb.Value, _cartsTable);
+        var existing = await cart.GetItemAsync(userId);
+        var items = existing is { Count: > 0 } && existing.Contains("items")
+            ? (existing["items"] as DynamoDBList)!.AsListOfDocument().Select(ItemFromDoc).ToList()
+            : new List<CartItem>();
+        if (items.Count == 0) return Json(BadRequest("Cart is empty"));
 
         var now = DateTimeOffset.UtcNow;
         var order = new Order(orderId, userId, "PLACED", now, items.Sum(i => i.Price * i.Quantity), items);
@@ -301,13 +327,17 @@ public sealed class ApiHandler
     private static APIGatewayHttpApiV2ProxyResponse NotFound(string message) => Json(new { error = message }, HttpStatusCode.NotFound);
     private static APIGatewayHttpApiV2ProxyResponse BadRequest(string message) => Json(new { error = message }, HttpStatusCode.BadRequest);
 
-    private static APIGatewayHttpApiV2ProxyResponse Json<T>(T value, HttpStatusCode code = HttpStatusCode.OK)
-        => new()
+    private static APIGatewayHttpApiV2ProxyResponse Json<T>(T value, HttpStatusCode code = HttpStatusCode.OK, int cacheSeconds = 0)
+    {
+        var headers = new Dictionary<string, string> { ["content-type"] = "application/json" };
+        if (cacheSeconds > 0) headers["cache-control"] = $"public, max-age={cacheSeconds}";
+        return new()
         {
             StatusCode = (int)code,
-            Headers = new Dictionary<string, string> { ["content-type"] = "application/json" },
+            Headers = headers,
             Body = JsonSerializer.Serialize(value, JsonOpts),
         };
+    }
 }
 
 // ---------------- records ----------------

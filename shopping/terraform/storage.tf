@@ -55,27 +55,12 @@ resource "aws_dynamodb_table" "orders" {
     type = "S"
   }
 
-  attribute {
-    name = "user_id"
-    type = "S"
-  }
-
-  # Range key of user-orders-index. Every index key attribute must be declared; the
-  # handler writes it as a string of epoch seconds.
-  attribute {
-    name = "created_at"
-    type = "S"
-  }
-
-  global_secondary_index {
-    name            = "user-orders-index"
-    hash_key        = "user_id"
-    range_key       = "created_at"
-    projection_type = "ALL"
-  }
+  # No user-orders-index yet: nothing reads orders by user, and an ALL-projection
+  # index doubles the write cost of every order and status change. Add it
+  # (user_id hash, created_at range) together with a "list my orders" route.
 
   stream_enabled   = true
-  stream_view_type = "NEW_AND_OLD_IMAGES"
+  stream_view_type = "NEW_IMAGE"
 
   ttl {
     enabled        = true

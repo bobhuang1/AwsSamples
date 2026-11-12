@@ -27,3 +27,9 @@ variable "frontend_origin_path" {
   default     = ""
   description = "S3 bucket folder the CloudFront origin mounts, e.g. \"/build\"."
 }
+
+variable "audit_retention_days" {
+  type        = number
+  default     = 365
+  description = "Days to keep audit objects before S3 expires them."
+}

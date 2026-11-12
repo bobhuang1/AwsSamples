@@ -109,6 +109,12 @@ resource "aws_apigatewayv2_stage" "shop" {
   api_id        = aws_apigatewayv2_api.shop.id
   name          = local.api_stage
   deployment_id = aws_apigatewayv2_deployment.shop.id
+
+  # Cap the request rate so a client loop cannot drive Lambda/DynamoDB cost.
+  default_route_settings {
+    throttling_rate_limit  = 50
+    throttling_burst_limit = 100
+  }
 }
 
 resource "aws_lambda_permission" "api" {
