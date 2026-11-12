@@ -3,8 +3,11 @@
 #  - SessionHandler.Handle       WebSocket API (connect / relay / disconnect)
 #  - TelemetryConsumer.Handle    Kinesis stream -> S3 (raw game telemetry)
 
-resource "aws_cloudwatch_log_group" "game" {
-  name              = "/aws/lambda/${local.unique}-game"
+# One log group per function, named exactly /aws/lambda/<function name>:
+# that is the only group Lambda writes to.
+resource "aws_cloudwatch_log_group" "lambda" {
+  for_each          = toset(["http", "ws", "telemetry", "authorizer"])
+  name              = "/aws/lambda/${local.unique}-${each.key}"
   retention_in_days = 14
 }
 
@@ -30,10 +33,13 @@ resource "aws_iam_role_policy" "http" {
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [
-      { Effect = "Allow", Action = "logs:CreateLogStream", Resource = aws_cloudwatch_log_group.game.arn },
-      { Effect = "Allow", Action = ["logs:PutLogEvents"], Resource = "${aws_cloudwatch_log_group.game.arn}:*" },
-      { Effect = "Allow", Action = ["dynamodb:GetItem", "dynamodb:Query", "dynamodb:PutItem", "dynamodb:UpdateItem", "dynamodb:BatchWriteItem", "dynamodb:DeleteItem"],
-      Resource = [aws_dynamodb_table.players.arn, aws_dynamodb_table.queue.arn, aws_dynamodb_table.matches.arn, aws_dynamodb_table.leaderboard.arn, "${aws_dynamodb_table.players.arn}/index/*", "${aws_dynamodb_table.queue.arn}/index/*", "${aws_dynamodb_table.matches.arn}/index/*", "${aws_dynamodb_table.leaderboard.arn}/index/*"] },
+      { Effect = "Allow", Action = "logs:CreateLogStream", Resource = aws_cloudwatch_log_group.lambda["http"].arn },
+      { Effect = "Allow", Action = ["logs:PutLogEvents"], Resource = "${aws_cloudwatch_log_group.lambda["http"].arn}:*" },
+      { Effect = "Allow", Action = ["dynamodb:GetItem", "dynamodb:UpdateItem"], Resource = aws_dynamodb_table.players.arn },
+      { Effect = "Allow", Action = ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem", "dynamodb:Query"], Resource = aws_dynamodb_table.queue.arn },
+      { Effect = "Allow", Action = ["dynamodb:GetItem", "dynamodb:PutItem"], Resource = aws_dynamodb_table.matches.arn },
+      { Effect = "Allow", Action = "dynamodb:UpdateItem", Resource = aws_dynamodb_table.leaderboard.arn },
+      { Effect = "Allow", Action = "dynamodb:Query", Resource = "${aws_dynamodb_table.leaderboard.arn}/index/board-score-index" },
     ]
   })
 }
@@ -50,11 +56,14 @@ resource "aws_iam_role_policy" "ws" {
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [
-      { Effect = "Allow", Action = "logs:CreateLogStream", Resource = aws_cloudwatch_log_group.game.arn },
-      { Effect = "Allow", Action = ["logs:PutLogEvents"], Resource = "${aws_cloudwatch_log_group.game.arn}:*" },
-      { Effect = "Allow", Action = ["dynamodb:GetItem", "dynamodb:Query", "dynamodb:PutItem", "dynamodb:DeleteItem"],
-      Resource = [aws_dynamodb_table.connections.arn, aws_dynamodb_table.matches.arn, "${aws_dynamodb_table.connections.arn}/index/*", "${aws_dynamodb_table.matches.arn}/index/*"] },
-      { Effect = "Allow", Action = "execute-api:ManageConnections", Resource = aws_apigatewayv2_stage.ws.execution_arn },
+      { Effect = "Allow", Action = "logs:CreateLogStream", Resource = aws_cloudwatch_log_group.lambda["ws"].arn },
+      { Effect = "Allow", Action = ["logs:PutLogEvents"], Resource = "${aws_cloudwatch_log_group.lambda["ws"].arn}:*" },
+      { Effect = "Allow", Action = ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:DeleteItem"], Resource = aws_dynamodb_table.connections.arn },
+      { Effect = "Allow", Action = "dynamodb:Query", Resource = "${aws_dynamodb_table.connections.arn}/index/match-index" },
+      { Effect = "Allow", Action = "dynamodb:GetItem", Resource = aws_dynamodb_table.matches.arn },
+      # PostToConnection is authorized against <api>/<stage>/POST/@connections/<id>,
+      # not against the bare stage ARN.
+      { Effect = "Allow", Action = "execute-api:ManageConnections", Resource = "${aws_apigatewayv2_stage.ws.execution_arn}/POST/@connections/*" },
     ]
   })
 }
@@ -71,11 +80,13 @@ resource "aws_iam_role_policy" "telemetry" {
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [
-      { Effect = "Allow", Action = "logs:CreateLogStream", Resource = aws_cloudwatch_log_group.game.arn },
-      { Effect = "Allow", Action = ["logs:PutLogEvents"], Resource = "${aws_cloudwatch_log_group.game.arn}:*" },
-      { Effect = "Allow", Action = ["kinesis:GetRecords", "kinesis:GetShardIterator", "kinesis:DescribeStream", "kinesis:ListStreams", "kinesis:DescribeStreamSummary"],
+      { Effect = "Allow", Action = "logs:CreateLogStream", Resource = aws_cloudwatch_log_group.lambda["telemetry"].arn },
+      { Effect = "Allow", Action = ["logs:PutLogEvents"], Resource = "${aws_cloudwatch_log_group.lambda["telemetry"].arn}:*" },
+      { Effect = "Allow", Action = ["kinesis:GetRecords", "kinesis:GetShardIterator", "kinesis:DescribeStream", "kinesis:DescribeStreamSummary", "kinesis:ListShards"],
       Resource = aws_kinesis_stream.telemetry.arn },
+      { Effect = "Allow", Action = "kinesis:ListStreams", Resource = "*" },
       { Effect = "Allow", Action = "s3:PutObject", Resource = "${aws_s3_bucket.telemetry.arn}/*" },
+      { Effect = "Allow", Action = "sqs:SendMessage", Resource = aws_sqs_queue.telemetry_failures.arn },
     ]
   })
 }
@@ -89,6 +100,7 @@ resource "aws_lambda_function" "http" {
   source_code_hash = filebase64sha256("${path.module}/dist/GameBackend.zip")
   timeout          = 30
   memory_size      = 512
+  depends_on       = [aws_cloudwatch_log_group.lambda["http"]]
 
   environment {
     variables = {
@@ -109,6 +121,7 @@ resource "aws_lambda_function" "ws" {
   source_code_hash = filebase64sha256("${path.module}/dist/GameBackend.zip")
   timeout          = 30
   memory_size      = 512
+  depends_on       = [aws_cloudwatch_log_group.lambda["ws"]]
 
   environment {
     variables = {
@@ -128,6 +141,7 @@ resource "aws_lambda_function" "telemetry" {
   source_code_hash = filebase64sha256("${path.module}/dist/GameBackend.zip")
   timeout          = 60
   memory_size      = 512
+  depends_on       = [aws_cloudwatch_log_group.lambda["telemetry"]]
 
   environment {
     variables = {
@@ -140,7 +154,7 @@ resource "aws_lambda_function" "telemetry" {
 # the raw JSONL in S3 for later analytics (Athena/QuickSight on top).
 resource "aws_kinesis_stream" "telemetry" {
   name             = "${local.unique}-telemetry"
-  shard_count      = 2
+  shard_count      = var.telemetry_shard_count
   retention_period = 24
   stream_mode_details {
     stream_mode = "PROVISIONED"
@@ -153,6 +167,24 @@ resource "aws_lambda_event_source_mapping" "telemetry" {
   starting_position      = "LATEST"
   batch_size             = 100
   parallelization_factor = 2
+
+  # A bad record must not block the shard until the 24 h retention drops it:
+  # retry a few times, split the batch to isolate the record, then park it.
+  maximum_retry_attempts         = 3
+  maximum_record_age_in_seconds  = 3600
+  bisect_batch_on_function_error = true
+
+  destination_config {
+    on_failure {
+      destination_arn = aws_sqs_queue.telemetry_failures.arn
+    }
+  }
+}
+
+# Metadata of batches that kept failing (not the records themselves).
+resource "aws_sqs_queue" "telemetry_failures" {
+  name                      = "${local.unique}-telemetry-failures"
+  message_retention_seconds = 1209600
 }
 
 resource "aws_s3_bucket" "telemetry" {
@@ -160,10 +192,23 @@ resource "aws_s3_bucket" "telemetry" {
   force_destroy = true
 }
 
-resource "aws_s3_bucket_versioning" "telemetry" {
+# Telemetry objects are written once under random keys, so versioning would only
+# multiply storage. Expire them instead of letting the bucket grow forever.
+resource "aws_s3_bucket_lifecycle_configuration" "telemetry" {
   bucket = aws_s3_bucket.telemetry.id
-  versioning_configuration {
+
+  rule {
+    id     = "expire-telemetry"
     status = "Enabled"
+    filter {}
+
+    expiration {
+      days = var.telemetry_retention_days
+    }
+
+    abort_incomplete_multipart_upload {
+      days_after_initiation = 7
+    }
   }
 }
 

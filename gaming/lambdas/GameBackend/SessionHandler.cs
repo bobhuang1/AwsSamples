@@ -22,6 +22,13 @@ public sealed class SessionHandler
     private readonly string _matchesTable     = Shared.Env("MATCHES_TABLE", "matches");
     private readonly string _wsEndpoint       = Shared.Env("WS_ENDPOINT", "");
 
+    private const int MaxParallelPosts = 16;
+
+    // One client for the life of the container, so the TLS connection is reused.
+    private static AmazonApiGatewayManagementApiClient? _api;
+    private AmazonApiGatewayManagementApiClient Api =>
+        _api ??= new AmazonApiGatewayManagementApiClient(new AmazonApiGatewayManagementApiConfig { ServiceURL = _wsEndpoint });
+
     public async Task<APIGatewayProxyResponse> Handle(APIGatewayProxyRequest request, ILambdaContext context)
     {
         try
@@ -104,6 +111,7 @@ public sealed class SessionHandler
         var peers = await connections.Query(new QueryOperationConfig
         {
             IndexName     = "match-index",
+            Select        = SelectValues.AllProjectedAttributes, // KEYS_ONLY index: connection_id is all we read
             KeyExpression = new Expression
             {
                 ExpressionStatement = "match_id = :m",
@@ -111,32 +119,30 @@ public sealed class SessionHandler
             },
         }).GetRemainingAsync();
 
-        var api = new AmazonApiGatewayManagementApiClient(new AmazonApiGatewayManagementApiConfig { ServiceURL = _wsEndpoint });
-
-        foreach (var conn in peers)
+        var data = System.Text.Encoding.UTF8.GetBytes(JsonSerializer.Serialize(new
         {
-            var targetId = conn["connection_id"].AsString();
-            if (targetId == connectionId) continue;
+            action = action,
+            from_player = senderId,
+            payload = payload,
+        }, Shared.JsonOpts));
+
+        await Parallel.ForEachAsync(peers.Select(c => c["connection_id"].AsString()).Where(id => id != connectionId),
+            new ParallelOptions { MaxDegreeOfParallelism = MaxParallelPosts }, async (targetId, ct) =>
+        {
             try
             {
-                await api.PostToConnectionAsync(new PostToConnectionRequest
+                await Api.PostToConnectionAsync(new PostToConnectionRequest
                 {
                     ConnectionId = targetId,
-                    Data = new MemoryStream(System.Text.Encoding.UTF8.GetBytes(JsonSerializer.Serialize(new
-                    {
-                        action = action,
-                        from_player = senderId,
-                        payload = payload,
-                    }, Shared.JsonOpts))),
-                });
+                    Data = new MemoryStream(data),
+                }, ct);
             }
             catch (GoneException gex)
             {
                 context.Logger.LogInformation("Stale connection removed: {0} ({1})", targetId, gex.Message);
-                await connections.DeleteItemAsync(targetId);
+                await connections.DeleteItemAsync(targetId, ct);
             }
-        }
-        api.Dispose();
+        });
         return new APIGatewayProxyResponse { StatusCode = 200, Body = "relayed" };
     }
 

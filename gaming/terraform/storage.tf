@@ -100,7 +100,7 @@ resource "aws_dynamodb_table" "connections" {
   global_secondary_index {
     name            = "match-index"
     hash_key        = "match_id"
-    projection_type = "ALL"
+    projection_type = "KEYS_ONLY"
   }
 
   ttl {

@@ -35,7 +35,17 @@ public sealed class TelemetryConsumer
                     continue;
                 }
 
-                var decoded = Encoding.UTF8.GetString(Convert.FromBase64String(data.GetString()!));
+                string decoded;
+                try
+                {
+                    decoded = Encoding.UTF8.GetString(Convert.FromBase64String(data.GetString()!));
+                }
+                catch (FormatException)
+                {
+                    // One malformed record must not fail the batch (and block the shard).
+                    context.Logger.LogWarning("Skipping a Kinesis record that is not valid base64");
+                    continue;
+                }
                 foreach (var line in decoded.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
                     lines.Add(line);
             }

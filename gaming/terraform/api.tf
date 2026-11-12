@@ -64,6 +64,12 @@ resource "aws_apigatewayv2_stage" "http" {
   api_id        = aws_apigatewayv2_api.http.id
   name          = local.api_stage
   deployment_id = aws_apigatewayv2_deployment.http.id
+
+  # Cap the request rate so a client loop cannot drive Lambda/DynamoDB cost.
+  default_route_settings {
+    throttling_rate_limit  = 50
+    throttling_burst_limit = 100
+  }
 }
 
 resource "aws_lambda_permission" "http" {
@@ -132,6 +138,12 @@ resource "aws_apigatewayv2_stage" "ws" {
   api_id        = aws_apigatewayv2_api.ws.id
   name          = local.api_stage
   deployment_id = aws_apigatewayv2_deployment.ws.id
+
+  # Cap the request rate so a client loop cannot drive Lambda/DynamoDB cost.
+  default_route_settings {
+    throttling_rate_limit  = 50
+    throttling_burst_limit = 100
+  }
 }
 
 resource "aws_lambda_permission" "ws" {

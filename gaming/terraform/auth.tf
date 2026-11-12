@@ -49,8 +49,8 @@ resource "aws_iam_role_policy" "authorizer" {
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [
-      { Effect = "Allow", Action = "logs:CreateLogStream", Resource = aws_cloudwatch_log_group.game.arn },
-      { Effect = "Allow", Action = ["logs:PutLogEvents"], Resource = "${aws_cloudwatch_log_group.game.arn}:*" },
+      { Effect = "Allow", Action = "logs:CreateLogStream", Resource = aws_cloudwatch_log_group.lambda["authorizer"].arn },
+      { Effect = "Allow", Action = ["logs:PutLogEvents"], Resource = "${aws_cloudwatch_log_group.lambda["authorizer"].arn}:*" },
     ]
   })
 }
@@ -64,6 +64,7 @@ resource "aws_lambda_function" "authorizer" {
   source_code_hash = filebase64sha256("${path.module}/dist/GameBackend.zip")
   timeout          = 10
   memory_size      = 512
+  depends_on       = [aws_cloudwatch_log_group.lambda["authorizer"]]
 
   environment {
     variables = {

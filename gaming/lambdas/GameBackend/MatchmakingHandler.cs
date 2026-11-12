@@ -19,17 +19,41 @@ internal static class Shared
 
     public static string Env(string name, string fallback) => Environment.GetEnvironmentVariable(name) ?? fallback;
 
-    public static APIGatewayHttpApiV2ProxyResponse HttpJson<T>(T value, HttpStatusCode code = HttpStatusCode.OK)
-        => new()
+    public static APIGatewayHttpApiV2ProxyResponse HttpJson<T>(T value, HttpStatusCode code = HttpStatusCode.OK, int cacheSeconds = 0)
+    {
+        var headers = new Dictionary<string, string> { ["content-type"] = "application/json" };
+        if (cacheSeconds > 0) headers["cache-control"] = $"public, max-age={cacheSeconds}";
+        return new()
         {
             StatusCode = (int)code,
-            Headers = new Dictionary<string, string> { ["content-type"] = "application/json" },
+            Headers = headers,
             Body = JsonSerializer.Serialize(value, JsonOpts),
         };
+    }
+
+    /// <summary>
+    /// The request path without the API stage. With a named stage (not $default) HTTP APIs
+    /// put the stage in front of rawPath (/v1/players); routes are matched without it.
+    /// </summary>
+    public static string RoutePath(APIGatewayHttpApiV2ProxyRequest request)
+    {
+        var path = request.RawPath ?? "/";
+        var stage = request.RequestContext?.Stage;
+        if (!string.IsNullOrEmpty(stage) && stage != "$default")
+        {
+            var prefix = "/" + stage;
+            if (path == prefix) return "/";
+            if (path.StartsWith(prefix + "/", StringComparison.Ordinal)) return path[prefix.Length..];
+        }
+        return path;
+    }
 
     public static string Segment(string path, int index)
         => Uri.UnescapeDataString(path.Split('/', StringSplitOptions.RemoveEmptyEntries)[index]);
 }
+
+/// <summary>A client error whose message is written by this code and safe to return.</summary>
+internal sealed class BadRequestException(string message) : Exception(message);
 
 /// <summary>HTTP API handler: players, matchmaking queue, matches, leaderboard.</summary>
 public sealed class MatchmakingHandler
@@ -43,7 +67,7 @@ public sealed class MatchmakingHandler
     {
         try
         {
-            var (method, path) = (request.RequestContext.Http.Method, request.RawPath);
+            var (method, path) = (request.RequestContext.Http.Method, Shared.RoutePath(request));
 
             if ((method, path) == ("GET", "/leaderboard/top"))
                 return await TopScores(request); // the only public route (see api.tf)
@@ -64,9 +88,14 @@ public sealed class MatchmakingHandler
                 _                                                  => Shared.HttpJson(new { error = "Not found" }, HttpStatusCode.NotFound),
             };
         }
-        catch (Exception ex) when (ex is JsonException or InvalidOperationException)
+        catch (BadRequestException ex)
         {
             return Shared.HttpJson(new { error = ex.Message }, HttpStatusCode.BadRequest);
+        }
+        catch (Exception ex) when (ex is JsonException or IndexOutOfRangeException)
+        {
+            // Fixed text: parser and indexer messages describe internals.
+            return Shared.HttpJson(new { error = "Malformed request" }, HttpStatusCode.BadRequest);
         }
         catch (Exception ex)
         {
@@ -87,18 +116,23 @@ public sealed class MatchmakingHandler
     private async Task<APIGatewayHttpApiV2ProxyResponse> RegisterPlayer(APIGatewayHttpApiV2ProxyRequest request, string playerId)
     {
         var body = JsonSerializer.Deserialize<RegisterRequest>(request.Body ?? "", Shared.JsonOpts)
-            ?? throw new InvalidOperationException("Body must be { displayName }");
+            ?? throw new BadRequestException("Body must be { displayName }");
         if (string.IsNullOrWhiteSpace(body.DisplayName) || body.DisplayName.Length > 40)
-            throw new InvalidOperationException("displayName must be 1-40 characters");
+            throw new BadRequestException("displayName must be 1-40 characters");
 
-        var table = Table.LoadTable(Shared.Ddb.Value, _playersTable);
-        await table.PutItemAsync(new Document
+        // Registering again only renames the player: the counters and created_at of an
+        // existing profile are kept.
+        await Shared.Ddb.Value.UpdateItemAsync(new UpdateItemRequest
         {
-            ["player_id"] = playerId,
-            ["display_name"] = body.DisplayName,
-            ["games_played"] = 0,
-            ["wins"] = 0,
-            ["created_at"] = DateTimeOffset.UtcNow.ToUnixTimeSeconds().ToString(),
+            TableName = _playersTable,
+            Key = new Dictionary<string, AttributeValue> { ["player_id"] = new() { S = playerId } },
+            UpdateExpression = "SET display_name = :n, created_at = if_not_exists(created_at, :c), games_played = if_not_exists(games_played, :z), wins = if_not_exists(wins, :z)",
+            ExpressionAttributeValues = new Dictionary<string, AttributeValue>
+            {
+                [":n"] = new() { S = body.DisplayName },
+                [":c"] = new() { S = DateTimeOffset.UtcNow.ToUnixTimeSeconds().ToString() },
+                [":z"] = new() { N = "0" },
+            },
         });
         return Shared.HttpJson(new { player_id = playerId, display_name = body.DisplayName });
     }
@@ -116,11 +150,11 @@ public sealed class MatchmakingHandler
     private async Task<APIGatewayHttpApiV2ProxyResponse> JoinQueue(APIGatewayHttpApiV2ProxyRequest request, string playerId)
     {
         var body = JsonSerializer.Deserialize<JoinQueueRequest>(request.Body ?? "", Shared.JsonOpts)
-            ?? throw new InvalidOperationException("Body must be { gameId, teamSize }");
+            ?? throw new BadRequestException("Body must be { gameId, teamSize }");
         if (string.IsNullOrWhiteSpace(body.GameId) || body.GameId.Length > 64)
-            throw new InvalidOperationException("gameId must be 1-64 characters");
+            throw new BadRequestException("gameId must be 1-64 characters");
         if (body.TeamSize is < MinTeamSize or > MaxTeamSize)
-            throw new InvalidOperationException($"teamSize must be {MinTeamSize}-{MaxTeamSize}");
+            throw new BadRequestException($"teamSize must be {MinTeamSize}-{MaxTeamSize}");
 
         var table = Table.LoadTable(Shared.Ddb.Value, _queueTable);
         var now = DateTimeOffset.UtcNow;
@@ -279,9 +313,9 @@ public sealed class MatchmakingHandler
         if (playerId != caller)
             return Forbidden();
         var body = JsonSerializer.Deserialize<ScoreRequest>(request.Body ?? "", Shared.JsonOpts)
-            ?? throw new InvalidOperationException("Body must be { score }");
+            ?? throw new BadRequestException("Body must be { score }");
         if (body.Score < 0)
-            throw new InvalidOperationException("score must not be negative");
+            throw new BadRequestException("score must not be negative");
 
         try
         {
@@ -334,7 +368,8 @@ public sealed class MatchmakingHandler
             },
         }).GetRemainingAsync();
 
-        return Shared.HttpJson(top.Select(d => new ScoreRow(d["player_id"].AsString(), d.Contains("score") ? d["score"].AsInt() : 0)).ToList());
+        return Shared.HttpJson(top.Select(d => new ScoreRow(d["player_id"].AsString(), d.Contains("score") ? d["score"].AsInt() : 0)).ToList(),
+            HttpStatusCode.OK, cacheSeconds: 10); // public and uncached would send every refresh to DynamoDB
     }
 }
 

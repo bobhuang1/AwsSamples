@@ -43,6 +43,13 @@ terraform apply plan.tfplan
 Inspect `terraform/outputs.tf` for the endpoints, then follow each sample's
 README. `terraform destroy` tears everything down.
 
+## Demo scope and security
+
+These are demo stacks. They deploy with open Cognito self-sign-up, no MFA, wide-open
+CORS, throttling only at the API stage, and a score-reporting endpoint that trusts the
+client (the leaderboard score is client-reported). Do not point real users or real data
+at them as they are, and tear them down (`terraform destroy`) when you are finished.
+
 ## Hardening / multi-region notes
 
 The samples are single-region by design so they stay readable. The scale

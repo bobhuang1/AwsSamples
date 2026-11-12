@@ -10,7 +10,7 @@ Kinesis telemetry pipeline landing raw client events into S3.
 players
    |                             live path                    telemetry path
    |   ┌─────────────────────────────┐                ┌─────────────────────────────┐
-   |   │ WebSocket API ($connect,    │                │ Kinesis stream (2 shards)   │
+   |   │ WebSocket API ($connect,    │                │ Kinesis stream (1 shard)   │
    |   │  $default, $disconnect)     │                │        │                    │
    |   │        │                    │                │ ESM batch read               │
    |   │   SessionHandler Lambda     │                │        │                    │
@@ -33,7 +33,7 @@ HTTP API ($default route) ──► MatchmakingHandler Lambda
 | Matchmaking | DynamoDB | Lobby partition per game; when the partition holds `teamSize` players the poller creates the match |
 | Realtime relay | Lambda + `postToConnection` | Query connections GSI by `match_id`, fan the event out; GRPC-style `GoneException` prunes stale sockets |
 | Leaderboard | DynamoDB + GSI | `board→score` GSI; top-N = one descending query, no scans |
-| Telemetry | Kinesis → Lambda → S3 | 2-shard stream, batched JSONL objects partitioned by day, ready for Athena |
+| Telemetry | Kinesis → Lambda → S3 | 1-shard stream by default (`telemetry_shard_count`); failing batches are retried, split, then parked in an SQS queue;, batched JSONL objects partitioned by day, ready for Athena |
 
 ## Deploy
 
@@ -55,8 +55,8 @@ $client = (terraform output -raw cognito_client_id)
 
 aws cognito-idp admin-create-user --user-pool-id $pool --username alice --temporary-password 'TempPass1!' --message-action SUPPRESS
 aws cognito-idp admin-set-user-password --user-pool-id $pool --username alice --password 'YourPass1!' --permanent
-$token = (aws cognito-idp initiate-auth --client-id $client --auth-flow alice_PASSWORD_AUTH `
-  --auth-parameters aliceNAME=alice,PASSWORD='YourPass1!' --query AuthenticationResult.IdToken --output text)
+$token = (aws cognito-idp initiate-auth --client-id $client --auth-flow USER_PASSWORD_AUTH `
+  --auth-parameters USERNAME=alice,PASSWORD='YourPass1!' --query AuthenticationResult.IdToken --output text)
 ```
 
 Repeat for a second user (`bob`, `$tokenBob`). The player id is the token's
