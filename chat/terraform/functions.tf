@@ -100,7 +100,7 @@ resource "aws_iam_role_policy" "fanout" {
 resource "aws_lambda_function" "message" {
   function_name    = "${local.unique}-message"
   role             = aws_iam_role.message.arn
-  runtime          = "dotnet8"
+  runtime          = "dotnet10"
   handler          = "ChatRelay::ChatRelay.MessageHandler::Handle"
   filename         = "${path.module}/dist/ChatRelay.zip"
   source_code_hash = filebase64sha256("${path.module}/dist/ChatRelay.zip")
@@ -120,7 +120,7 @@ resource "aws_lambda_function" "message" {
 resource "aws_lambda_function" "fanout" {
   function_name    = "${local.unique}-fanout"
   role             = aws_iam_role.fanout.arn
-  runtime          = "dotnet8"
+  runtime          = "dotnet10"
   handler          = "ChatRelay::ChatRelay.FanoutConsumer::Handle"
   filename         = "${path.module}/dist/ChatRelay.zip"
   source_code_hash = filebase64sha256("${path.module}/dist/ChatRelay.zip")

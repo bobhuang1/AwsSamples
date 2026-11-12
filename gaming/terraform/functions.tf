@@ -97,7 +97,7 @@ resource "aws_iam_role_policy" "telemetry" {
 resource "aws_lambda_function" "http" {
   function_name    = "${local.unique}-http"
   role             = aws_iam_role.http.arn
-  runtime          = "dotnet8"
+  runtime          = "dotnet10"
   handler          = "GameBackend::GameBackend.MatchmakingHandler::Handle"
   filename         = "${path.module}/dist/GameBackend.zip"
   source_code_hash = filebase64sha256("${path.module}/dist/GameBackend.zip")
@@ -119,7 +119,7 @@ resource "aws_lambda_function" "http" {
 resource "aws_lambda_function" "ws" {
   function_name    = "${local.unique}-ws"
   role             = aws_iam_role.ws.arn
-  runtime          = "dotnet8"
+  runtime          = "dotnet10"
   handler          = "GameBackend::GameBackend.SessionHandler::Handle"
   filename         = "${path.module}/dist/GameBackend.zip"
   source_code_hash = filebase64sha256("${path.module}/dist/GameBackend.zip")
@@ -139,7 +139,7 @@ resource "aws_lambda_function" "ws" {
 resource "aws_lambda_function" "telemetry" {
   function_name    = "${local.unique}-telemetry"
   role             = aws_iam_role.telemetry.arn
-  runtime          = "dotnet8"
+  runtime          = "dotnet10"
   handler          = "GameBackend::GameBackend.TelemetryConsumer::Handle"
   filename         = "${path.module}/dist/GameBackend.zip"
   source_code_hash = filebase64sha256("${path.module}/dist/GameBackend.zip")

@@ -21,8 +21,8 @@ locals {
           "ForAllValues:StringEquals" = { "dynamodb:Attributes" = ["product_id", "stock"] }
         }
       },
-      # Cart lines: Query (read the cart), UpdateItem (atomic add), DeleteItem (remove / checkout).
-      { Effect = "Allow", Action = ["dynamodb:Query", "dynamodb:UpdateItem", "dynamodb:DeleteItem"], Resource = aws_dynamodb_table.carts.arn },
+      # Cart: GetItem (read), UpdateItem (atomic add / remove of a line), DeleteItem (empty the cart at checkout).
+      { Effect = "Allow", Action = ["dynamodb:GetItem", "dynamodb:UpdateItem", "dynamodb:DeleteItem"], Resource = aws_dynamodb_table.carts.arn },
       { Effect = "Allow", Action = ["dynamodb:GetItem", "dynamodb:PutItem"], Resource = aws_dynamodb_table.orders.arn },
     ]
     orders-outbox = [
@@ -88,7 +88,7 @@ resource "aws_iam_role_policy" "lambda" {
 resource "aws_lambda_function" "api" {
   function_name    = "${local.unique}-api"
   role             = aws_iam_role.lambda["api"].arn
-  runtime          = "dotnet8"
+  runtime          = "dotnet10"
   handler          = "ShoppingApi::ShoppingApi.ApiHandler::Handle"
   filename         = "${path.module}/dist/ShoppingApi.zip"
   source_code_hash = filebase64sha256("${path.module}/dist/ShoppingApi.zip")
@@ -113,7 +113,7 @@ resource "aws_lambda_function" "api" {
 resource "aws_lambda_function" "orders_outbox" {
   function_name    = "${local.unique}-orders-outbox"
   role             = aws_iam_role.lambda["orders-outbox"].arn
-  runtime          = "dotnet8"
+  runtime          = "dotnet10"
   handler          = "OrderWorkflow::OrderWorkflow.Functions::PublishOrder"
   filename         = "${path.module}/dist/OrderWorkflow.zip"
   source_code_hash = filebase64sha256("${path.module}/dist/OrderWorkflow.zip")
@@ -148,7 +148,7 @@ resource "aws_lambda_event_source_mapping" "orders_outbox" {
 resource "aws_lambda_function" "orders_worker" {
   function_name    = "${local.unique}-orders-worker"
   role             = aws_iam_role.lambda["orders-worker"].arn
-  runtime          = "dotnet8"
+  runtime          = "dotnet10"
   handler          = "OrderWorkflow::OrderWorkflow.Functions::ProcessOrder"
   filename         = "${path.module}/dist/OrderWorkflow.zip"
   source_code_hash = filebase64sha256("${path.module}/dist/OrderWorkflow.zip")
@@ -168,7 +168,7 @@ resource "aws_lambda_function" "orders_worker" {
 resource "aws_lambda_function" "orders_complete" {
   function_name    = "${local.unique}-orders-complete"
   role             = aws_iam_role.lambda["orders-complete"].arn
-  runtime          = "dotnet8"
+  runtime          = "dotnet10"
   handler          = "OrderWorkflow::OrderWorkflow.Functions::CompleteOrder"
   filename         = "${path.module}/dist/OrderWorkflow.zip"
   source_code_hash = filebase64sha256("${path.module}/dist/OrderWorkflow.zip")
@@ -187,7 +187,7 @@ resource "aws_lambda_function" "orders_complete" {
 resource "aws_lambda_function" "orders_audit" {
   function_name    = "${local.unique}-orders-audit"
   role             = aws_iam_role.lambda["orders-audit"].arn
-  runtime          = "dotnet8"
+  runtime          = "dotnet10"
   handler          = "OrderWorkflow::OrderWorkflow.Functions::AuditOrder"
   filename         = "${path.module}/dist/OrderWorkflow.zip"
   source_code_hash = filebase64sha256("${path.module}/dist/OrderWorkflow.zip")

@@ -8,7 +8,7 @@ $proj = Join-Path $root "lambdas\ChatRelay\ChatRelay.csproj"
 New-Item -ItemType Directory -Path $dist -Force | Out-Null
 
 Write-Host "Publishing ChatRelay..." -ForegroundColor Cyan
-dotnet publish $proj -c Release -f net8.0 -o (Join-Path $root "lambdas\ChatRelay\publish") | Out-Null
+dotnet publish $proj -c Release -f net10.0 -o (Join-Path $root "lambdas\ChatRelay\publish") | Out-Null
 if ($LASTEXITCODE -ne 0) { throw "dotnet publish failed" }
 Compress-Archive -Path (Join-Path $root "lambdas\ChatRelay\publish\*") -DestinationPath (Join-Path $dist "ChatRelay.zip") -Force
 

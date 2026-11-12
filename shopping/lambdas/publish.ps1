@@ -15,7 +15,7 @@ $projects = @(
 foreach ($p in $projects) {
     $out = Join-Path $publish "$($p.Name)\publish"
     Write-Host "Publishing $($p.Name)..." -ForegroundColor Cyan
-    dotnet publish (Join-Path $publish $p.Project) -c Release -f net8.0 -o $out | Out-Null
+    dotnet publish (Join-Path $publish $p.Project) -c Release -f net10.0 -o $out | Out-Null
     if ($LASTEXITCODE -ne 0) { throw "dotnet publish failed for $($p.Name)" }
     Compress-Archive -Path (Join-Path $out '*') -DestinationPath (Join-Path $dist "$($p.Name).zip") -Force
     Write-Host "  -> terraform/dist/$($p.Name).zip" -ForegroundColor Green

@@ -1,7 +1,7 @@
 # Aws
 
 Sample code for deploying **large-scale web sites on AWS** — serverless-first
-architecture with Terraform as the infrastructure-as-code layer and .NET 8
+architecture with Terraform as the infrastructure-as-code layer and .NET 10
 Lambda handlers for the application code. Three scenarios, each self-contained
 under its own folder (own Terraform state, own deploy script, own README):
 
@@ -16,8 +16,8 @@ under its own folder (own Terraform state, own deploy script, own README):
 Every scenario follows the same mental model:
 
 - **Stateless compute everywhere** — no EC2 or containers; Lambda scales
-  without operator involvement. Code is plain .NET 8 (managed runtime,
-  `lambda-runtime` `dotnet8`, no custom container).
+  without operator involvement. Code is plain .NET 10 (managed runtime,
+  `lambda-runtime` `dotnet10`, no custom container).
 - **Managed data planes** — DynamoDB with PAY_PER_REQUEST billing, TTLs,
   and global secondary indexes instead of instance-managed databases.
 - **Async by default** — SQS queues + Dead Letter Queues buffer work;
@@ -27,7 +27,7 @@ Every scenario follows the same mental model:
 
 ## Deploying any sample
 
-Prerequisites: Terraform 1.6+, .NET 8 SDK, the AWS CLI with credentials
+Prerequisites: Terraform 1.6+, .NET 10 SDK, the AWS CLI with credentials
 (`aws configure`, or `AWS_PROFILE`), and an S3 bucket for the sample's
 Terraform state (or keep local state for learning).
 

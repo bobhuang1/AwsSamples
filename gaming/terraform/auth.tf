@@ -58,7 +58,7 @@ resource "aws_iam_role_policy" "authorizer" {
 resource "aws_lambda_function" "authorizer" {
   function_name    = "${local.unique}-authorizer"
   role             = aws_iam_role.authorizer.arn
-  runtime          = "dotnet8"
+  runtime          = "dotnet10"
   handler          = "GameBackend::GameBackend.ConnectAuthorizer::Handle"
   filename         = "${path.module}/dist/GameBackend.zip"
   source_code_hash = filebase64sha256("${path.module}/dist/GameBackend.zip")

@@ -8,7 +8,7 @@ $proj = Join-Path $root "lambdas\GameBackend\GameBackend.csproj"
 New-Item -ItemType Directory -Path $dist -Force | Out-Null
 
 Write-Host "Publishing GameBackend..." -ForegroundColor Cyan
-dotnet publish $proj -c Release -f net8.0 -o (Join-Path $root "lambdas\GameBackend\publish") | Out-Null
+dotnet publish $proj -c Release -f net10.0 -o (Join-Path $root "lambdas\GameBackend\publish") | Out-Null
 if ($LASTEXITCODE -ne 0) { throw "dotnet publish failed" }
 Compress-Archive -Path (Join-Path $root "lambdas\GameBackend\publish\*") -DestinationPath (Join-Path $dist "GameBackend.zip") -Force
 

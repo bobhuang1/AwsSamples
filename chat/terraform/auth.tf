@@ -58,7 +58,7 @@ resource "aws_iam_role_policy" "authorizer" {
 resource "aws_lambda_function" "authorizer" {
   function_name    = "${local.unique}-authorizer"
   role             = aws_iam_role.authorizer.arn
-  runtime          = "dotnet8"
+  runtime          = "dotnet10"
   handler          = "ChatRelay::ChatRelay.ConnectAuthorizer::Handle"
   filename         = "${path.module}/dist/ChatRelay.zip"
   source_code_hash = filebase64sha256("${path.module}/dist/ChatRelay.zip")
