@@ -3,8 +3,23 @@
 # hit from the browser directly, so CORS is allowed on the API.
 
 resource "aws_s3_bucket" "frontend" {
+  # checkov:skip=CKV_AWS_21: No versioning on purpose: the content is rebuilt from the repository (frontend/index.html) on every apply
   bucket        = "${local.unique}-frontend"
   force_destroy = true
+}
+
+resource "aws_s3_bucket_lifecycle_configuration" "frontend" {
+  bucket = aws_s3_bucket.frontend.id
+
+  rule {
+    id     = "abort-incomplete-uploads"
+    status = "Enabled"
+    filter {}
+
+    abort_incomplete_multipart_upload {
+      days_after_initiation = 7
+    }
+  }
 }
 
 resource "aws_s3_bucket_public_access_block" "frontend" {
@@ -54,6 +69,7 @@ data "aws_cloudfront_cache_policy" "optimized" {
 }
 
 resource "aws_cloudfront_distribution" "frontend" {
+  # checkov:skip=CKV2_AWS_47: Log4j is covered by the KnownBadInputs managed rule group on the web ACL; this check also demands AWSManagedRulesAnonymousIpList, which would block shoppers on VPNs and proxies
   enabled             = true
   default_root_object = "index.html"
   price_class         = "PriceClass_100"

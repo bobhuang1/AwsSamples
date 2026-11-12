@@ -3,6 +3,7 @@
 #   -> Step Functions (timed fulfillment) -> EventBridge (audit + downstream)
 
 resource "aws_sqs_queue" "orders" {
+  sqs_managed_sse_enabled    = true
   name                       = "${local.unique}-orders"
   visibility_timeout_seconds = 360 # at least 6x the 60 s worker timeout (AWS guidance)
   message_retention_seconds  = 86400
@@ -14,6 +15,7 @@ resource "aws_sqs_queue" "orders" {
 }
 
 resource "aws_sqs_queue" "orders_dlq" {
+  sqs_managed_sse_enabled   = true
   name                      = "${local.unique}-orders-dlq"
   message_retention_seconds = 1209600
 }
@@ -119,6 +121,8 @@ locals {
 }
 
 resource "aws_sfn_state_machine" "orders" {
+  # checkov:skip=CKV_AWS_284: No X-Ray tracing: a Wait plus one Lambda task; execution history and CloudWatch metrics are enough for the sample
+  # checkov:skip=CKV_AWS_285: Log level ERROR without execution data on purpose: order contents stay out of the logs and the log cost stays low
   name       = "${local.unique}-orders"
   role_arn   = aws_iam_role.sfn.arn
   type       = "STANDARD"
@@ -163,6 +167,7 @@ resource "aws_lambda_permission" "audit" {
 # ---------- Audit trail bucket ----------
 
 resource "aws_s3_bucket" "audit" {
+  # checkov:skip=CKV_AWS_21: No versioning on purpose: objects are written once under random keys and expire by lifecycle rule, so old versions would only add cost
   bucket        = "${local.unique}-audit"
   force_destroy = true
 }

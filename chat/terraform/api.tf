@@ -29,12 +29,14 @@ resource "aws_apigatewayv2_route" "connect" {
 }
 
 resource "aws_apigatewayv2_route" "disconnect" {
+  # checkov:skip=CKV_AWS_309: WebSocket route without its own authorizer: the connection was authorized once, on $connect, by the Cognito-token authorizer, and the handler checks the stored connection
   api_id    = aws_apigatewayv2_api.chat.id
   route_key = "$disconnect"
   target    = "integrations/${aws_apigatewayv2_integration.chat.id}"
 }
 
 resource "aws_apigatewayv2_route" "default" {
+  # checkov:skip=CKV_AWS_309: WebSocket route without its own authorizer: the connection was authorized once, on $connect, by the Cognito-token authorizer, and the handler checks the stored connection
   api_id    = aws_apigatewayv2_api.chat.id
   route_key = "$default"
   target    = "integrations/${aws_apigatewayv2_integration.chat.id}"

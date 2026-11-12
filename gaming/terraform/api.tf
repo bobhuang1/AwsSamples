@@ -22,6 +22,7 @@ resource "aws_apigatewayv2_integration" "http" {
 # Public leaderboard; every other route needs a Cognito ID token, and the
 # handler takes the player id from its "sub" claim.
 resource "aws_apigatewayv2_route" "leaderboard_public" {
+  # checkov:skip=CKV_AWS_309: Intentionally unauthenticated: the public leaderboard read; scores are written only by the IAM-signed result route
   api_id    = aws_apigatewayv2_api.http.id
   route_key = "GET /leaderboard/top"
   target    = "integrations/${aws_apigatewayv2_integration.http.id}"
@@ -128,12 +129,14 @@ resource "aws_apigatewayv2_route" "connect" {
 }
 
 resource "aws_apigatewayv2_route" "disconnect" {
+  # checkov:skip=CKV_AWS_309: WebSocket route without its own authorizer: the connection was authorized once, on $connect, by the Cognito-token authorizer, and the handler checks the stored connection
   api_id    = aws_apigatewayv2_api.ws.id
   route_key = "$disconnect"
   target    = "integrations/${aws_apigatewayv2_integration.ws.id}"
 }
 
 resource "aws_apigatewayv2_route" "default" {
+  # checkov:skip=CKV_AWS_309: WebSocket route without its own authorizer: the connection was authorized once, on $connect, by the Cognito-token authorizer, and the handler checks the stored connection
   api_id    = aws_apigatewayv2_api.ws.id
   route_key = "$default"
   target    = "integrations/${aws_apigatewayv2_integration.ws.id}"

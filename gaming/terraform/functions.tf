@@ -157,6 +157,10 @@ resource "aws_lambda_function" "telemetry" {
 # Kinesis stream for game telemetry; the Lambda reads it in batches and lands
 # the raw JSONL in S3 for later analytics (Athena/QuickSight on top).
 resource "aws_kinesis_stream" "telemetry" {
+  # checkov:skip=CKV_AWS_185: Encrypted with the AWS managed key (aws/kinesis); a customer managed key adds a monthly fee and key policy for a demo stream
+  # AWS managed key: producers and consumers need no extra key permissions.
+  encryption_type  = "KMS"
+  kms_key_id       = "alias/aws/kinesis"
   name             = "${local.unique}-telemetry"
   shard_count      = var.telemetry_shard_count
   retention_period = 24
@@ -187,11 +191,13 @@ resource "aws_lambda_event_source_mapping" "telemetry" {
 
 # Metadata of batches that kept failing (not the records themselves).
 resource "aws_sqs_queue" "telemetry_failures" {
+  sqs_managed_sse_enabled   = true
   name                      = "${local.unique}-telemetry-failures"
   message_retention_seconds = 1209600
 }
 
 resource "aws_s3_bucket" "telemetry" {
+  # checkov:skip=CKV_AWS_21: No versioning on purpose: objects are written once under random keys and expire by lifecycle rule, so old versions would only add cost
   bucket        = "${local.unique}-telemetry"
   force_destroy = true
 }

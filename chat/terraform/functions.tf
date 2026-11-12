@@ -1,5 +1,6 @@
 # Fan-out: buffered via SQS so delivery backlogs never slow the writer.
 resource "aws_sqs_queue" "fanout" {
+  sqs_managed_sse_enabled    = true
   name                       = "${local.unique}-fanout"
   visibility_timeout_seconds = 360 # at least 6x the 60 s fanout timeout (AWS guidance)
   message_retention_seconds  = 86400
@@ -10,6 +11,7 @@ resource "aws_sqs_queue" "fanout" {
 }
 
 resource "aws_sqs_queue" "fanout_dlq" {
+  sqs_managed_sse_enabled   = true
   name                      = "${local.unique}-fanout-dlq"
   message_retention_seconds = 1209600
 }

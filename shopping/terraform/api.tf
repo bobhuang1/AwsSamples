@@ -64,6 +64,7 @@ resource "aws_apigatewayv2_integration" "shop" {
 
 # Public catalog route (no auth) + catch-all default (JWT protected).
 resource "aws_apigatewayv2_route" "products_public" {
+  # checkov:skip=CKV_AWS_309: Intentionally unauthenticated: the public catalog (see api.tf); every other route requires the Cognito JWT
   api_id    = aws_apigatewayv2_api.shop.id
   route_key = "GET /products"
   target    = "integrations/${aws_apigatewayv2_integration.shop.id}"
