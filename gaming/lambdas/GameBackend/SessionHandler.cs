@@ -3,7 +3,6 @@ using System.Text.Json;
 using Amazon.ApiGatewayManagementApi;
 using Amazon.ApiGatewayManagementApi.Model;
 using Amazon.DynamoDBv2;
-using Amazon.DynamoDBv2.DocumentModel;
 using Amazon.DynamoDBv2.Model;
 using Amazon.Lambda.APIGatewayEvents;
 using Amazon.Lambda.Core;
@@ -25,9 +24,22 @@ public sealed class SessionHandler
     private const int MaxParallelPosts = 16;
 
     // One client for the life of the container, so the TLS connection is reused.
-    private static AmazonApiGatewayManagementApiClient? _api;
-    private AmazonApiGatewayManagementApiClient Api =>
-        _api ??= new AmazonApiGatewayManagementApiClient(new AmazonApiGatewayManagementApiConfig { ServiceURL = _wsEndpoint });
+    private static IAmazonApiGatewayManagementApi? _sharedApi;
+
+    private readonly IAmazonDynamoDB _ddb;
+    private readonly IAmazonApiGatewayManagementApi? _injectedApi;
+
+    private IAmazonApiGatewayManagementApi Api =>
+        _injectedApi ?? (_sharedApi ??= new AmazonApiGatewayManagementApiClient(new AmazonApiGatewayManagementApiConfig { ServiceURL = _wsEndpoint }));
+
+    // The Lambda runtime uses this constructor.
+    public SessionHandler() : this(Shared.Ddb.Value, null) { }
+
+    public SessionHandler(IAmazonDynamoDB ddb, IAmazonApiGatewayManagementApi? api)
+    {
+        _ddb = ddb;
+        _injectedApi = api;
+    }
 
     public async Task<APIGatewayProxyResponse> Handle(APIGatewayProxyRequest request, ILambdaContext context)
     {
@@ -63,30 +75,30 @@ public sealed class SessionHandler
         if (string.IsNullOrEmpty(matchId))
             return new APIGatewayProxyResponse { StatusCode = 400, Body = "query param matchId required" };
 
-        var match = await Table.LoadTable(Shared.Ddb.Value, _matchesTable).GetItemAsync(matchId);
-        var players = match is not null && match.Contains("players") && match["players"] is PrimitiveList pl
-            ? pl.Entries.Select(e => e.AsString()).ToList()
-            : new List<string>();
+        var match = await _ddb.GetItemAsync(new GetItemRequest { TableName = _matchesTable, Key = Shared.Key("match_id", matchId) });
+        var players = match.Item is { Count: > 0 } m && m.TryGetValue("players", out var pl) ? pl.SS : [];
         if (!players.Contains(playerId))
             return new APIGatewayProxyResponse { StatusCode = 403, Body = "not a player in this match" };
 
         var now = DateTimeOffset.UtcNow;
-        var table = Table.LoadTable(Shared.Ddb.Value, _connectionsTable);
-        await table.PutItemAsync(new Document
+        await _ddb.PutItemAsync(new PutItemRequest
         {
-            ["connection_id"] = connectionId,
-            ["player_id"]     = playerId,
-            ["match_id"]      = matchId,
-            ["connected_at"]  = now.ToUnixTimeSeconds().ToString(),
-            ["ttl"]           = now.AddHours(1).ToUnixTimeSeconds(), // DynamoDB TTL only honours a Number attribute
+            TableName = _connectionsTable,
+            Item = new Dictionary<string, AttributeValue>
+            {
+                ["connection_id"] = Shared.S(connectionId),
+                ["player_id"]     = Shared.S(playerId),
+                ["match_id"]      = Shared.S(matchId),
+                ["connected_at"]  = Shared.S(now.ToUnixTimeSeconds().ToString()),
+                ["ttl"]           = Shared.N(now.AddHours(1).ToUnixTimeSeconds()), // DynamoDB TTL only honours a Number attribute
+            },
         });
         return Ok(connectionId, playerId, matchId);
     }
 
     private async Task<APIGatewayProxyResponse> OnDisconnect(string connectionId)
     {
-        var table = Table.LoadTable(Shared.Ddb.Value, _connectionsTable);
-        await table.DeleteItemAsync(connectionId);
+        await _ddb.DeleteItemAsync(new DeleteItemRequest { TableName = _connectionsTable, Key = Shared.Key("connection_id", connectionId) });
         return new APIGatewayProxyResponse { StatusCode = 200, Body = "bye" };
     }
 
@@ -100,24 +112,26 @@ public sealed class SessionHandler
 
         // Sender and match come from the connection record written at $connect, not from
         // the message body, so a client cannot speak for another player or another match.
-        var sender = await Table.LoadTable(Shared.Ddb.Value, _connectionsTable).GetItemAsync(connectionId);
-        if (sender is null || !sender.Contains("player_id") || !sender.Contains("match_id"))
+        var senderRes = await _ddb.GetItemAsync(new GetItemRequest { TableName = _connectionsTable, Key = Shared.Key("connection_id", connectionId) });
+        if (senderRes.Item is not { Count: > 0 } sender || Shared.Str(sender, "player_id") is not { } senderId || Shared.Str(sender, "match_id") is not { } matchId)
             return new APIGatewayProxyResponse { StatusCode = 401, Body = "not connected" };
-        var senderId = sender["player_id"].AsString();
-        var matchId = sender["match_id"].AsString();
 
-        // Relay to everyone else in the match.
-        var connections = Table.LoadTable(Shared.Ddb.Value, _connectionsTable);
-        var peers = await connections.Query(new QueryOperationConfig
+        // Relay to everyone else in the match (KEYS_ONLY index: connection_id is all we read).
+        var peerIds = new List<string>();
+        Dictionary<string, AttributeValue>? lastKey = null;
+        do
         {
-            IndexName     = "match-index",
-            Select        = SelectValues.AllProjectedAttributes, // KEYS_ONLY index: connection_id is all we read
-            KeyExpression = new Expression
+            var q = await _ddb.QueryAsync(new QueryRequest
             {
-                ExpressionStatement = "match_id = :m",
-                ExpressionAttributeValues = new Dictionary<string, DynamoDBEntry> { [":m"] = matchId },
-            },
-        }).GetRemainingAsync();
+                TableName = _connectionsTable,
+                IndexName = "match-index",
+                KeyConditionExpression = "match_id = :m",
+                ExpressionAttributeValues = new Dictionary<string, AttributeValue> { [":m"] = Shared.S(matchId) },
+                ExclusiveStartKey = lastKey,
+            });
+            peerIds.AddRange(q.Items.Select(i => i["connection_id"].S));
+            lastKey = q.LastEvaluatedKey is { Count: > 0 } ? q.LastEvaluatedKey : null;
+        } while (lastKey is not null);
 
         var data = System.Text.Encoding.UTF8.GetBytes(JsonSerializer.Serialize(new
         {
@@ -126,7 +140,7 @@ public sealed class SessionHandler
             payload = payload,
         }, Shared.JsonOpts));
 
-        await Parallel.ForEachAsync(peers.Select(c => c["connection_id"].AsString()).Where(id => id != connectionId),
+        await Parallel.ForEachAsync(peerIds.Where(id => id != connectionId),
             new ParallelOptions { MaxDegreeOfParallelism = MaxParallelPosts }, async (targetId, ct) =>
         {
             try
@@ -140,7 +154,7 @@ public sealed class SessionHandler
             catch (GoneException gex)
             {
                 context.Logger.LogInformation("Stale connection removed: {0} ({1})", targetId, gex.Message);
-                await connections.DeleteItemAsync(targetId, ct);
+                await _ddb.DeleteItemAsync(new DeleteItemRequest { TableName = _connectionsTable, Key = Shared.Key("connection_id", targetId) }, ct);
             }
         });
         return new APIGatewayProxyResponse { StatusCode = 200, Body = "relayed" };

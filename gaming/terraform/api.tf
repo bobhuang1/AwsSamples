@@ -27,6 +27,16 @@ resource "aws_apigatewayv2_route" "leaderboard_public" {
   target    = "integrations/${aws_apigatewayv2_integration.http.id}"
 }
 
+# Match results come from the game server, never from a player: this route is
+# signed with IAM (SigV4), so only a principal holding the report_results policy
+# (see outputs) can call it. The backend turns the reported stats into points.
+resource "aws_apigatewayv2_route" "match_result" {
+  api_id             = aws_apigatewayv2_api.http.id
+  route_key          = "POST /matches/{matchId}/result"
+  target             = "integrations/${aws_apigatewayv2_integration.http.id}"
+  authorization_type = "AWS_IAM"
+}
+
 resource "aws_apigatewayv2_authorizer" "jwt" {
   api_id           = aws_apigatewayv2_api.http.id
   authorizer_type  = "JWT"
@@ -54,10 +64,11 @@ resource "aws_apigatewayv2_deployment" "http" {
     redeployment = sha1(join(",", [
       aws_apigatewayv2_integration.http.id,
       aws_apigatewayv2_route.leaderboard_public.id,
+      aws_apigatewayv2_route.match_result.id,
       aws_apigatewayv2_route.http.id,
     ]))
   }
-  depends_on = [aws_apigatewayv2_route.http, aws_apigatewayv2_route.leaderboard_public]
+  depends_on = [aws_apigatewayv2_route.http, aws_apigatewayv2_route.leaderboard_public, aws_apigatewayv2_route.match_result]
 }
 
 resource "aws_apigatewayv2_stage" "http" {
@@ -70,6 +81,19 @@ resource "aws_apigatewayv2_stage" "http" {
     throttling_rate_limit  = 50
     throttling_burst_limit = 100
   }
+}
+
+# Attach this to the role of the game server that reports match results.
+resource "aws_iam_policy" "report_results" {
+  name        = "${local.unique}-report-results"
+  description = "Allows reporting match results to the leaderboard API."
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      { Effect = "Allow", Action = "execute-api:Invoke", Resource = "${aws_apigatewayv2_api.http.execution_arn}/${local.api_stage}/POST/matches/*/result" },
+    ]
+  })
 }
 
 resource "aws_lambda_permission" "http" {

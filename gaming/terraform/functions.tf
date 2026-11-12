@@ -36,8 +36,11 @@ resource "aws_iam_role_policy" "http" {
       { Effect = "Allow", Action = "logs:CreateLogStream", Resource = aws_cloudwatch_log_group.lambda["http"].arn },
       { Effect = "Allow", Action = ["logs:PutLogEvents"], Resource = "${aws_cloudwatch_log_group.lambda["http"].arn}:*" },
       { Effect = "Allow", Action = ["dynamodb:GetItem", "dynamodb:UpdateItem"], Resource = aws_dynamodb_table.players.arn },
-      { Effect = "Allow", Action = ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem", "dynamodb:Query"], Resource = aws_dynamodb_table.queue.arn },
-      { Effect = "Allow", Action = ["dynamodb:GetItem", "dynamodb:PutItem"], Resource = aws_dynamodb_table.matches.arn },
+      { Effect = "Allow", Action = ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem"], Resource = aws_dynamodb_table.queue.arn },
+      { Effect = "Allow", Action = "dynamodb:Query", Resource = "${aws_dynamodb_table.queue.arn}/index/lobby-index" },
+      # Matches: created by the matchmaker (Put), read, and closed when the game server reports the result (Update).
+      { Effect = "Allow", Action = ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem"], Resource = aws_dynamodb_table.matches.arn },
+      # Scores are only ever added by the match-result route (UpdateItem inside a transaction).
       { Effect = "Allow", Action = "dynamodb:UpdateItem", Resource = aws_dynamodb_table.leaderboard.arn },
       { Effect = "Allow", Action = "dynamodb:Query", Resource = "${aws_dynamodb_table.leaderboard.arn}/index/board-score-index" },
     ]
@@ -104,10 +107,11 @@ resource "aws_lambda_function" "http" {
 
   environment {
     variables = {
-      PLAYERS_TABLE     = aws_dynamodb_table.players.name
-      QUEUE_TABLE       = aws_dynamodb_table.queue.name
-      MATCHES_TABLE     = aws_dynamodb_table.matches.name
-      LEADERBOARD_TABLE = aws_dynamodb_table.leaderboard.name
+      PLAYERS_TABLE      = aws_dynamodb_table.players.name
+      QUEUE_TABLE        = aws_dynamodb_table.queue.name
+      MATCHES_TABLE      = aws_dynamodb_table.matches.name
+      LEADERBOARD_TABLE  = aws_dynamodb_table.leaderboard.name
+      LEADERBOARD_SHARDS = tostring(var.leaderboard_shards)
     }
   }
 }

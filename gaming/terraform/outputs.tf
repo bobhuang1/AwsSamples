@@ -8,6 +8,11 @@ output "ws_endpoint" {
   value       = aws_apigatewayv2_stage.ws.invoke_url
 }
 
+output "report_results_policy_arn" {
+  description = "IAM policy to attach to the game server role that reports match results (POST /matches/{id}/result)."
+  value       = aws_iam_policy.report_results.arn
+}
+
 output "telemetry_stream" {
   value = aws_kinesis_stream.telemetry.name
 }

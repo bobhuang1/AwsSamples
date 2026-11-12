@@ -16,6 +16,17 @@ variable "name_prefix" {
   description = "Short prefix for resource names."
 }
 
+variable "leaderboard_shards" {
+  type        = number
+  default     = 8
+  description = "Index keys the leaderboard is split over (1-32). Raising it later needs a backfill: a player moves to the new shard on their next scored match."
+
+  validation {
+    condition     = var.leaderboard_shards >= 1 && var.leaderboard_shards <= 32 && floor(var.leaderboard_shards) == var.leaderboard_shards
+    error_message = "leaderboard_shards must be a whole number from 1 to 32."
+  }
+}
+
 variable "telemetry_shard_count" {
   type        = number
   default     = 1

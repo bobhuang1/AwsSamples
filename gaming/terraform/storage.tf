@@ -13,6 +13,10 @@ resource "aws_dynamodb_table" "players" {
 
 # ---------- Matchmaking queue: one partition per game; waiting players have a
 # TTL so a never-filled lobby leaks nothing. ----------
+#
+# lobby ("<game>#<team size>") and lobby_ts (join time) exist only on WAITING slots,
+# which makes lobby-index a sparse index: a poll reads the few longest-waiting
+# players from it instead of every slot of the game partition.
 
 resource "aws_dynamodb_table" "queue" {
   name         = "${local.unique}-queue"
@@ -28,6 +32,23 @@ resource "aws_dynamodb_table" "queue" {
   attribute {
     name = "player_id"
     type = "S"
+  }
+
+  attribute {
+    name = "lobby"
+    type = "S"
+  }
+
+  attribute {
+    name = "lobby_ts"
+    type = "N"
+  }
+
+  global_secondary_index {
+    name            = "lobby-index"
+    hash_key        = "lobby"
+    range_key       = "lobby_ts"
+    projection_type = "KEYS_ONLY"
   }
 
   ttl {
@@ -49,8 +70,10 @@ resource "aws_dynamodb_table" "matches" {
   }
 }
 
-# ---------- Leaderboard: hash player_id, GSI on (board, score) so the global
-# top-N is a single descending Query instead of a table scan. ----------
+# ---------- Leaderboard: hash player_id, GSI on (board, score). "board" is a
+# sharded key ("global#0" ... "global#<leaderboard_shards-1>") so score writes
+# spread over several index partitions; the top-N is one descending Query per
+# shard, merged by the Lambda. Scores are written by the backend only. ----------
 
 resource "aws_dynamodb_table" "leaderboard" {
   name         = "${local.unique}-leaderboard"

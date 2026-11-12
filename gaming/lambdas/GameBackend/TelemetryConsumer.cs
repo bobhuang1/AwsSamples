@@ -16,9 +16,13 @@ namespace GameBackend;
 /// </summary>
 public sealed class TelemetryConsumer
 {
-    private static readonly Lazy<AmazonS3Client> S3 = new(() => new AmazonS3Client());
-
+    private readonly IAmazonS3 _s3;
     private readonly string _bucket = Shared.Env("TELEMETRY_BUCKET", "telemetry");
+
+    // The Lambda runtime uses this constructor.
+    public TelemetryConsumer() : this(new AmazonS3Client()) { }
+
+    public TelemetryConsumer(IAmazonS3 s3) => _s3 = s3;
 
     public async Task<object?> Handle(JsonElement input, ILambdaContext context)
     {
@@ -56,7 +60,7 @@ public sealed class TelemetryConsumer
         var now = DateTimeOffset.UtcNow;
         var key = $"telemetry/{now:yyyy}/{now:MM}/{now:dd}/{Guid.NewGuid():N}.jsonl";
 
-        await S3.Value.PutObjectAsync(new Amazon.S3.Model.PutObjectRequest
+        await _s3.PutObjectAsync(new Amazon.S3.Model.PutObjectRequest
         {
             BucketName = _bucket,
             Key = key,
