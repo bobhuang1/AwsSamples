@@ -95,7 +95,9 @@ awscurl --service execute-api --region <region> -X POST "<api_endpoint>/matches/
 Points per player: `kills*100 + objectives*250 + 500 if won - deaths*25`, never below 0 and
 never above 10,000 per match (kills and deaths 0-50, objectives 0-20, else 400). Only players
 of the match are accepted, one entry per player, and a match can be scored once (a second
-report gets 409), so a player has at most one score per match. The leaderboard score is the
+report gets 409; a transient cancellation, such as a write conflict or throttling, gets 503 with
+`Retry-After` and the game server should retry), so a player has at most one score per match.
+The same transaction adds one game (and one win for winners) to each player's profile. The leaderboard score is the
 running total of those match points.
 
 For the live relay, connect two browsers to `$ws` with
@@ -120,8 +122,9 @@ aws kinesis put-record --stream-name "<telemetry_stream>" --partition-key "alice
 - **Relay fan-out without a broker.** Connection state lives in DynamoDB and
   the WebSocket API does the global fan-out — no Redis or cluster of socket
   servers to run. Eight connections or eight hundred thousand, same p99.
-- **TTL lobbies.** A queue slot that never fills expires in 10 minutes; idle
-  sockets drop after an hour. Tables stay bounded with zero cleanup code.
+- **TTL lobbies.** A queue slot that never fills expires in 10 minutes; socket
+  records live 3 hours (API Gateway ends a socket after 2) and a player may
+  hold at most 5 sockets (`429` otherwise). Tables stay bounded with zero cleanup code.
 - **Polls do not read the partition.** Only WAITING slots have the `lobby` and
   `lobby_ts` keys, so `lobby-index` holds exactly the waiting players. A poll
   queries it for the `teamSize` oldest, so its cost depends on the team size,
@@ -141,7 +144,7 @@ aws kinesis put-record --stream-name "<telemetry_stream>" --partition-key "alice
   scored match; until then they are not on the board you read, so backfill the
   `board` attribute of existing rows when you change it.
 - **Telemetry that doesn't spike the DB.** Clients slam Kinesis (2 shards per
-  ~1k writes/s, dial it via `shard_count`), the consumer batches JSONL, and the
+  ~1k writes/s, dial it via `shard_count`), the consumer batches JSONL (up to 100 records or 60 s, so a quiet stream writes one S3 object a minute), and the
   data plane (DynamoDB) is never touched by the analytics stream.
 - **No cold fix-it ops.** Every Lambda is stateless and ready-runs on managed
   runtimes; "scaling" is throughput ceilings on managed services.

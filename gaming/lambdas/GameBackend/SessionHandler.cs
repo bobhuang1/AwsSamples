@@ -23,6 +23,14 @@ public sealed class SessionHandler
 
     private const int MaxParallelPosts = 16;
 
+    // Sockets one player may hold at once. Each message is posted to every socket of the
+    // match, so an uncapped player could multiply the cost of every message.
+    private const int MaxSocketsPerPlayer = 5;
+
+    // API Gateway ends a WebSocket after 2 hours, so a record that lives 3 hours covers the
+    // longest session without refreshing it (DynamoDB deletes expired items lazily, later).
+    private static readonly TimeSpan ConnectionLease = TimeSpan.FromHours(3);
+
     // One client for the life of the container, so the TLS connection is reused.
     private static IAmazonApiGatewayManagementApi? _sharedApi;
 
@@ -55,6 +63,10 @@ public sealed class SessionHandler
                 _ => await OnMessage(request, connectionId, context),
             };
         }
+        catch (JsonException)
+        {
+            return new APIGatewayProxyResponse { StatusCode = 400, Body = "malformed message" };
+        }
         catch (Exception ex)
         {
             context.Logger.LogError("WS failure: {0}", ex);
@@ -75,10 +87,23 @@ public sealed class SessionHandler
         if (string.IsNullOrEmpty(matchId))
             return new APIGatewayProxyResponse { StatusCode = 400, Body = "query param matchId required" };
 
-        var match = await _ddb.GetItemAsync(new GetItemRequest { TableName = _matchesTable, Key = Shared.Key("match_id", matchId) });
+        // Consistent read: a client often connects right after the match forms.
+        var match = await _ddb.GetItemAsync(new GetItemRequest { TableName = _matchesTable, Key = Shared.Key("match_id", matchId), ConsistentRead = true });
         var players = match.Item is { Count: > 0 } m && m.TryGetValue("players", out var pl) ? pl.SS : [];
         if (!players.Contains(playerId))
             return new APIGatewayProxyResponse { StatusCode = 403, Body = "not a player in this match" };
+
+        var open = await _ddb.QueryAsync(new QueryRequest
+        {
+            TableName = _connectionsTable,
+            IndexName = "player-index",
+            KeyConditionExpression = "player_id = :p",
+            ExpressionAttributeValues = new Dictionary<string, AttributeValue> { [":p"] = Shared.S(playerId) },
+            Select = Select.COUNT,
+            Limit = MaxSocketsPerPlayer,
+        });
+        if (open.Count >= MaxSocketsPerPlayer)
+            return new APIGatewayProxyResponse { StatusCode = 429, Body = "too many open connections" };
 
         var now = DateTimeOffset.UtcNow;
         await _ddb.PutItemAsync(new PutItemRequest
@@ -90,7 +115,7 @@ public sealed class SessionHandler
                 ["player_id"]     = Shared.S(playerId),
                 ["match_id"]      = Shared.S(matchId),
                 ["connected_at"]  = Shared.S(now.ToUnixTimeSeconds().ToString()),
-                ["ttl"]           = Shared.N(now.AddHours(1).ToUnixTimeSeconds()), // DynamoDB TTL only honours a Number attribute
+                ["ttl"]           = Shared.N(now.Add(ConnectionLease).ToUnixTimeSeconds()), // DynamoDB TTL only honours a Number attribute
             },
         });
         return Ok(connectionId, playerId, matchId);
@@ -107,7 +132,16 @@ public sealed class SessionHandler
         using var body = JsonDocument.Parse(request.Body ?? "{}");
         var root = body.RootElement;
 
-        var action = root.TryGetProperty("action", out var a) ? a.GetString() : null;
+        // Valid JSON of the wrong shape is a client error, not a failure of this function.
+        if (root.ValueKind != JsonValueKind.Object)
+            return new APIGatewayProxyResponse { StatusCode = 400, Body = "message must be a JSON object" };
+        string? action = null;
+        if (root.TryGetProperty("action", out var a))
+        {
+            if (a.ValueKind is not (JsonValueKind.String or JsonValueKind.Null))
+                return new APIGatewayProxyResponse { StatusCode = 400, Body = "action must be a string" };
+            action = a.GetString();
+        }
         var payload = root.TryGetProperty("payload", out var p) ? p.GetRawText() : "{}";
 
         // Sender and match come from the connection record written at $connect, not from

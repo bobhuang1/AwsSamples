@@ -62,7 +62,10 @@ resource "aws_iam_role_policy" "ws" {
       { Effect = "Allow", Action = "logs:CreateLogStream", Resource = aws_cloudwatch_log_group.lambda["ws"].arn },
       { Effect = "Allow", Action = ["logs:PutLogEvents"], Resource = "${aws_cloudwatch_log_group.lambda["ws"].arn}:*" },
       { Effect = "Allow", Action = ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:DeleteItem"], Resource = aws_dynamodb_table.connections.arn },
-      { Effect = "Allow", Action = "dynamodb:Query", Resource = "${aws_dynamodb_table.connections.arn}/index/match-index" },
+      { Effect = "Allow", Action = "dynamodb:Query", Resource = [
+        "${aws_dynamodb_table.connections.arn}/index/match-index",
+        "${aws_dynamodb_table.connections.arn}/index/player-index",
+      ] },
       { Effect = "Allow", Action = "dynamodb:GetItem", Resource = aws_dynamodb_table.matches.arn },
       # PostToConnection is authorized against <api>/<stage>/POST/@connections/<id>,
       # not against the bare stage ARN.
@@ -175,6 +178,10 @@ resource "aws_lambda_event_source_mapping" "telemetry" {
   starting_position      = "LATEST"
   batch_size             = 100
   parallelization_factor = 2
+
+  # Wait up to a minute to fill a batch: at low volume this means one invocation (and one
+  # S3 object) per minute instead of one per handful of records.
+  maximum_batching_window_in_seconds = 60
 
   # A bad record must not block the shard until the 24 h retention drops it:
   # retry a few times, split the batch to isolate the record, then park it.

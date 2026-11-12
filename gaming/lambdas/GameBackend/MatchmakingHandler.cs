@@ -368,7 +368,8 @@ public sealed class MatchmakingHandler
 
     private async Task<APIGatewayHttpApiV2ProxyResponse> MatchView(string matchId)
     {
-        var res = await _ddb.GetItemAsync(new GetItemRequest { TableName = _matchesTable, Key = Shared.Key("match_id", matchId) });
+        // Consistent read: the match was usually written a moment ago by this very request.
+        var res = await _ddb.GetItemAsync(new GetItemRequest { TableName = _matchesTable, Key = Shared.Key("match_id", matchId), ConsistentRead = true });
         if (res.Item is not { Count: > 0 } doc)
             return Shared.HttpJson(new { error = "No match " + matchId }, HttpStatusCode.NotFound);
         return Shared.HttpJson(new MatchView(matchId, Shared.Str(doc, "game_id") ?? "", Shared.Str(doc, "status") ?? "", doc.TryGetValue("players", out var p) ? p.SS : []));
@@ -442,13 +443,35 @@ public sealed class MatchmakingHandler
             },
         }));
 
+        // The profile counters: one more game for everybody in the result, one more win for the winners.
+        var won = body.Results!.ToDictionary(r => r.PlayerId, r => r.Won, StringComparer.Ordinal);
+        items.AddRange(scores.Keys.Select(playerId => new TransactWriteItem
+        {
+            Update = new Update
+            {
+                TableName = _playersTable,
+                Key = Shared.Key("player_id", playerId),
+                UpdateExpression = "ADD games_played :one, wins :w",
+                ExpressionAttributeValues = new Dictionary<string, AttributeValue>
+                {
+                    [":one"] = Shared.N(1),
+                    [":w"] = Shared.N(won[playerId] ? 1 : 0),
+                },
+            },
+        }));
+
         try
         {
             await _ddb.TransactWriteItemsAsync(new TransactWriteItemsRequest { TransactItems = items });
         }
-        catch (TransactionCanceledException)
+        catch (TransactionCanceledException ex)
         {
-            return Shared.HttpJson(new { error = "This match result was already recorded." }, HttpStatusCode.Conflict);
+            // Item 0 is the match update. Only its failed condition means "already scored";
+            // a conflict or throttle on any item is transient and the game server must retry.
+            if (ex.CancellationReasons is { Count: > 0 } reasons && reasons[0].Code == "ConditionalCheckFailed")
+                return Shared.HttpJson(new { error = "This match result was already recorded." }, HttpStatusCode.Conflict);
+            return Shared.HttpJson(new { error = "The result could not be recorded right now. Retry the request." }, HttpStatusCode.ServiceUnavailable,
+                extraHeaders: new Dictionary<string, string> { ["retry-after"] = "2" });
         }
 
         return Shared.HttpJson(new { match_id = matchId, scores = scores.Select(kv => new ScoreRow(kv.Key, kv.Value)).ToList() });

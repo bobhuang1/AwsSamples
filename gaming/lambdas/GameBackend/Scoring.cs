@@ -47,6 +47,8 @@ public static class MatchScoring
         var scores = new Dictionary<string, int>(StringComparer.Ordinal);
         foreach (var r in results)
         {
+            if (r is null)
+                throw new BadRequestException("Every result must be an object");
             if (string.IsNullOrEmpty(r.PlayerId) || !roster.Contains(r.PlayerId))
                 throw new BadRequestException("Every result must be for a player of this match");
             if (r.Kills is < 0 or > MaxKills || r.Deaths is < 0 or > MaxDeaths || r.Objectives is < 0 or > MaxObjectives)

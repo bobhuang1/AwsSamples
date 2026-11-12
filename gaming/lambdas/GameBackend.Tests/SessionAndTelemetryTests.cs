@@ -45,10 +45,53 @@ public class SessionHandlerTests
     }
 
     [Fact]
+    public async Task The_match_is_read_consistently_on_connect_and_the_record_outlives_a_two_hour_socket()
+    {
+        GetItemRequest? read = null;
+        _ddb.GetItemAsync(Arg.Do<GetItemRequest>(r => read = r), Arg.Any<CancellationToken>())
+            .Returns(new GetItemResponse { Item = new() { ["match_id"] = S("m1"), ["players"] = new AttributeValue { SS = ["alice"] } } });
+        _ddb.QueryAsync(Arg.Any<QueryRequest>(), Arg.Any<CancellationToken>()).Returns(new QueryResponse { Count = 0 });
+        PutItemRequest? put = null;
+        _ddb.PutItemAsync(Arg.Do<PutItemRequest>(r => put = r), Arg.Any<CancellationToken>()).Returns(new PutItemResponse());
+
+        await new SessionHandler(_ddb, _api).Handle(Ws("$connect", "c1", userId: "alice", matchId: "m1"), Context());
+
+        Assert.True(read!.ConsistentRead);
+        var ttl = long.Parse(put!.Item["ttl"].N);
+        Assert.True(ttl - DateTimeOffset.UtcNow.ToUnixTimeSeconds() > 2 * 3600);
+    }
+
+    [Fact]
+    public async Task A_player_cannot_hold_more_than_five_sockets()
+    {
+        _ddb.GetItemAsync(Arg.Any<GetItemRequest>(), Arg.Any<CancellationToken>())
+            .Returns(new GetItemResponse { Item = new() { ["match_id"] = S("m1"), ["players"] = new AttributeValue { SS = ["alice"] } } });
+        _ddb.QueryAsync(Arg.Any<QueryRequest>(), Arg.Any<CancellationToken>()).Returns(new QueryResponse { Count = 5 });
+
+        var res = await new SessionHandler(_ddb, _api).Handle(Ws("$connect", "c6", userId: "alice", matchId: "m1"), Context());
+
+        Assert.Equal(429, res.StatusCode);
+        await _ddb.DidNotReceiveWithAnyArgs().PutItemAsync(default!, default);
+    }
+
+    [Theory]
+    [InlineData("[1,2]")]
+    [InlineData("\"text\"")]
+    [InlineData("""{"action":5}""")]
+    [InlineData("{not json")]
+    public async Task A_message_of_the_wrong_shape_is_a_400_not_a_500(string body)
+    {
+        var res = await new SessionHandler(_ddb, _api).Handle(Ws("$default", "c1", body), Context());
+
+        Assert.Equal(400, res.StatusCode);
+    }
+
+    [Fact]
     public async Task A_player_of_the_match_is_registered_on_connect()
     {
         _ddb.GetItemAsync(Arg.Any<GetItemRequest>(), Arg.Any<CancellationToken>())
             .Returns(new GetItemResponse { Item = new() { ["match_id"] = S("m1"), ["players"] = new AttributeValue { SS = ["alice", "bob"] } } });
+        _ddb.QueryAsync(Arg.Any<QueryRequest>(), Arg.Any<CancellationToken>()).Returns(new QueryResponse { Count = 0 });
         PutItemRequest? put = null;
         _ddb.PutItemAsync(Arg.Do<PutItemRequest>(r => put = r), Arg.Any<CancellationToken>()).Returns(new PutItemResponse());
         var handler = new SessionHandler(_ddb, _api);

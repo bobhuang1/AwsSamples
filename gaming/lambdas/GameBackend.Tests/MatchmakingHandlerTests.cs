@@ -64,7 +64,7 @@ public class MatchmakingHandlerTests
 
         Assert.Equal(200, res.StatusCode);
         Assert.NotNull(sent);
-        Assert.Equal(3, sent!.TransactItems.Count); // the match + two leaderboard rows
+        Assert.Equal(5, sent!.TransactItems.Count); // the match + two leaderboard rows + two player profiles
 
         var matchUpdate = sent.TransactItems[0].Update;
         Assert.Equal("matches", matchUpdate.TableName);
@@ -80,6 +80,35 @@ public class MatchmakingHandlerTests
 
         var scores = Json(res.Body).GetProperty("scores");
         Assert.Equal(2, scores.GetArrayLength());
+    }
+
+    [Fact]
+    public async Task The_result_updates_games_played_and_wins_on_the_player_profiles()
+    {
+        GivenMatch("ACTIVE", "alice", "bob");
+        TransactWriteItemsRequest? sent = null;
+        _ddb.TransactWriteItemsAsync(Arg.Do<TransactWriteItemsRequest>(r => sent = r), Arg.Any<CancellationToken>())
+            .Returns(new TransactWriteItemsResponse());
+
+        await _handler.Handle(Http("POST", "/matches/m1/result", TwoPlayerResult, iam: true), Context());
+
+        var profiles = sent!.TransactItems.Select(i => i.Update).Where(u => u.TableName == "players").ToDictionary(u => u.Key["player_id"].S);
+        Assert.Equal(2, profiles.Count);
+        Assert.Equal("ADD games_played :one, wins :w", profiles["alice"].UpdateExpression);
+        Assert.Equal("1", profiles["alice"].ExpressionAttributeValues[":w"].N); // winner
+        Assert.Equal("0", profiles["bob"].ExpressionAttributeValues[":w"].N);
+        Assert.Equal("1", profiles["bob"].ExpressionAttributeValues[":one"].N);
+    }
+
+    [Fact]
+    public async Task A_null_entry_in_results_is_a_400_not_a_500()
+    {
+        GivenMatch("ACTIVE", "alice", "bob");
+
+        var res = await _handler.Handle(Http("POST", "/matches/m1/result", """{"results":[null]}""", iam: true), Context());
+
+        Assert.Equal(400, res.StatusCode);
+        await _ddb.DidNotReceiveWithAnyArgs().TransactWriteItemsAsync(default!, default);
     }
 
     [Fact]
@@ -122,12 +151,31 @@ public class MatchmakingHandlerTests
     {
         GivenMatch("ACTIVE", "alice", "bob");
         _ddb.TransactWriteItemsAsync(Arg.Any<TransactWriteItemsRequest>(), Arg.Any<CancellationToken>())
-            .Returns<TransactWriteItemsResponse>(_ => throw new TransactionCanceledException("lost the race"));
+            .Returns<TransactWriteItemsResponse>(_ => throw Cancelled("ConditionalCheckFailed", "None", "None"));
 
         var res = await _handler.Handle(Http("POST", "/matches/m1/result", TwoPlayerResult, iam: true), Context());
 
         Assert.Equal(409, res.StatusCode);
     }
+
+    [Theory]
+    [InlineData("None", "TransactionConflict", "None")]
+    [InlineData("ThrottlingError", "None", "None")]
+    [InlineData("None", "ConditionalCheckFailed", "None")] // a leaderboard row failing is not "already scored"
+    public async Task A_transient_cancellation_is_a_503_the_game_server_can_retry(string first, string second, string third)
+    {
+        GivenMatch("ACTIVE", "alice", "bob");
+        _ddb.TransactWriteItemsAsync(Arg.Any<TransactWriteItemsRequest>(), Arg.Any<CancellationToken>())
+            .Returns<TransactWriteItemsResponse>(_ => throw Cancelled(first, second, third));
+
+        var res = await _handler.Handle(Http("POST", "/matches/m1/result", TwoPlayerResult, iam: true), Context());
+
+        Assert.Equal(503, res.StatusCode);
+        Assert.True(res.Headers.ContainsKey("retry-after"));
+    }
+
+    private static TransactionCanceledException Cancelled(params string[] codes)
+        => new("cancelled") { CancellationReasons = codes.Select(c => new CancellationReason { Code = c }).ToList() };
 
     [Fact]
     public async Task An_unknown_match_is_a_404()
@@ -247,6 +295,8 @@ public class MatchmakingHandlerTests
             Assert.Contains("REMOVE lobby, lobby_ts", u.UpdateExpression);
         });
         Assert.Equal("ACTIVE", Json(res.Body).GetProperty("status").GetString());
+        // The new match is read back with a consistent read: an eventually consistent one can miss it.
+        await _ddb.Received().GetItemAsync(Arg.Is<GetItemRequest>(r => r.TableName == "matches" && r.ConsistentRead == true), Arg.Any<CancellationToken>());
     }
 
     [Fact]

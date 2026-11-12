@@ -103,7 +103,7 @@ resource "aws_dynamodb_table" "leaderboard" {
   }
 }
 
-# ---------- WebSocket connections: keyed by connection, GSI by match ----------
+# ---------- WebSocket connections: keyed by connection, GSIs by match and by player ----------
 
 resource "aws_dynamodb_table" "connections" {
   name         = "${local.unique}-connections"
@@ -120,9 +120,21 @@ resource "aws_dynamodb_table" "connections" {
     type = "S"
   }
 
+  attribute {
+    name = "player_id"
+    type = "S"
+  }
+
   global_secondary_index {
     name            = "match-index"
     hash_key        = "match_id"
+    projection_type = "KEYS_ONLY"
+  }
+
+  # Counts a player's open sockets at $connect (the per-player cap).
+  global_secondary_index {
+    name            = "player-index"
+    hash_key        = "player_id"
     projection_type = "KEYS_ONLY"
   }
 
